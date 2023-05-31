@@ -10,7 +10,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll}, io::Cursor,
 };
 
 use bevy::{
@@ -24,7 +24,8 @@ use bevy::{
     DefaultPlugins,
 };
 use bevy_prototype_lyon::prelude::*;
-use image::DynamicImage;
+use futures::io::BufWriter;
+use image::{DynamicImage, ImageFormat};
 use rfd::FileHandle;
 use serde::{Deserialize, Serialize};
 
@@ -141,8 +142,39 @@ fn start(
     }
 }
 
-fn load(path: impl AsRef<Path>) -> Animation {
-    serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap()
+fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
+    let mut animation_file_data: AnimationFileData = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+
+    let cell_width = animation_file_data.spritesheet_info.cell_width as u32;
+    let cell_height = animation_file_data.spritesheet_info.cell_height as u32;
+    let cols = animation_file_data.spritesheet_info.columns as u32;
+    let frame_count = animation_file_data.spritesheet_info.frame_count as u32;
+
+    let image = image::load_from_memory(&animation_file_data.spritesheet).unwrap();
+    
+    let mut frames = vec![];
+
+    for i in 0..frame_count {
+        let x = i % cols;
+        let y = i / cols;
+
+        let handle = assets.add(Image::from_dynamic(image.crop_imm(x * cell_width, y * cell_width, cell_width, cell_height), true));
+        let frame_info = &animation_file_data.spritesheet_info.frame_data[i as usize];
+        let offset = frame_info.origin;
+        let delay = frame_info.delay;
+        
+        frames.push(Frame {
+            image: handle,
+            offset,
+            delay,
+        });
+    }
+
+    Animation {
+        timeline: Timeline {
+            frames
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,6 +189,9 @@ struct EditorState {
     current_animation: Animation,
     current_basepath: Option<String>,
     current_frame: usize,
+    action_list: Vec<Action>,
+    undo_depth: usize,
+    drag_starting_pos: Option<Vec2>,
 }
 
 impl EditorState {
@@ -165,33 +200,42 @@ impl EditorState {
             current_animation: Animation::new(),
             current_basepath: None,
             current_frame: 0,
+            action_list: vec![],
+            undo_depth: 0,
+            drag_starting_pos: None,
         }
     }
 
     fn save(&self, path: impl AsRef<Path>, assets: &Assets<Image>) {
-        let images = self.current_animation.timeline.frames.iter().map(|ih| {
-            let img = assets.get(&ih.image.image).unwrap();
-            let img = img.clone().try_into_dynamic().unwrap();
-            let offset = ih.offset + Vec2::new(img.width() as _, img.height() as _) / 2.0;
-            println!("{}", offset);
-            (img, offset)
-        }).collect::<Vec<_>>();
+        let images = self
+            .current_animation
+            .timeline
+            .frames
+            .iter()
+            .map(|ih| {
+                let img = assets.get(&ih.image).unwrap();
+                let img = img.clone().try_into_dynamic().unwrap();
+                let offset = ih.offset + Vec2::new(img.width() as _, img.height() as _) / 2.0;
+                println!("{}", offset);
+                (img, offset, ih.delay)
+            })
+            .collect::<Vec<_>>();
 
         let image_count = images.len();
 
-        let pre_min_image_width = images.iter().map(|(img, _)| img.width()).min();
-        let pre_max_image_width = images.iter().map(|(img, _)| img.width()).max();
-        let pre_min_image_height = images.iter().map(|(img, _)| img.height()).min();
-        let pre_max_image_height = images.iter().map(|(img, _)| img.height()).max();
+        let pre_min_image_width = images.iter().map(|(img, _, _)| img.width()).min();
+        let pre_max_image_width = images.iter().map(|(img, _, _)| img.width()).max();
+        let pre_min_image_height = images.iter().map(|(img, _, _)| img.height()).min();
+        let pre_max_image_height = images.iter().map(|(img, _, _)| img.height()).max();
 
         let mut image_bb_width = 0;
         let mut image_bb_height = 0;
 
         let mut cropped_images = vec![];
 
-        for (image, offset) in images {
+        for (image, offset, delay) in images {
             let pixels = image.as_rgba8().unwrap();
-            
+
             let mut left = pixels.width();
             let mut right = 0;
             let mut top = pixels.height();
@@ -221,7 +265,7 @@ impl EditorState {
             let cropped_image = image.crop_imm(left, top, width, height);
 
             let new_offset = Vec2::new(offset.x - left as f32, offset.y - top as f32);
-            cropped_images.push((cropped_image, new_offset));
+            cropped_images.push((cropped_image, new_offset, delay));
             println!("{new_offset}");
 
             image_bb_width = image_bb_width.max(width);
@@ -230,7 +274,7 @@ impl EditorState {
 
         let mut expanded_images = vec![];
 
-        for (image, offset) in cropped_images {
+        for (image, offset, delay) in cropped_images {
             let diff_x = image_bb_width - image.width();
             let diff_y = image_bb_height - image.height();
 
@@ -239,7 +283,11 @@ impl EditorState {
             let pad_top = diff_y / 2;
             let pad_bot = diff_y - pad_top;
 
-            println!("bb: {image_bb_width}, {image_bb_height} | width: {}, {}", image.width(), image.height());
+            println!(
+                "bb: {image_bb_width}, {image_bb_height} | width: {}, {}",
+                image.width(),
+                image.height()
+            );
             println!("left: {pad_left}, right: {pad_right}, top: {pad_top}, bot: {pad_bot}");
 
             let mut expanded_image = DynamicImage::new_rgba8(image_bb_width, image_bb_height);
@@ -248,7 +296,11 @@ impl EditorState {
 
             for x in 0..image_bb_width {
                 for y in 0..image_bb_height {
-                    if x < pad_left || image_bb_width - x - 1 < pad_right || y < pad_top || image_bb_height - y - 1 < pad_bot {
+                    if x < pad_left
+                        || image_bb_width - x - 1 < pad_right
+                        || y < pad_top
+                        || image_bb_height - y - 1 < pad_bot
+                    {
                         pixels[(x, y)].0 = [0; 4];
                     } else {
                         pixels[(x, y)] = orig_pixels[(x - pad_left, y - pad_top)];
@@ -256,10 +308,14 @@ impl EditorState {
                 }
             }
 
-            expanded_images.push((expanded_image, offset + Vec2::new(pad_left as _, pad_top as _)));
+            expanded_images.push((
+                expanded_image,
+                offset + Vec2::new(pad_left as _, pad_top as _),
+                delay,
+            ));
         }
 
-        for (index, (img, offset)) in expanded_images.iter().enumerate() {
+        for (index, (img, offset, delay)) in expanded_images.iter().enumerate() {
             let mut path = PathBuf::from(path.as_ref());
             let file_name = path.file_name().unwrap();
             let new_file_name = format!("{}.{index}.png", file_name.to_string_lossy());
@@ -268,12 +324,12 @@ impl EditorState {
         }
 
         let mut cols = expanded_images.len();
-        
+
         for c in (1..=expanded_images.len()).rev() {
             let r = expanded_images.len().div_ceil(c);
 
             let w = c * image_bb_width as usize;
-            let h =  r * image_bb_height as usize;
+            let h = r * image_bb_height as usize;
 
             if h > w {
                 break;
@@ -284,9 +340,10 @@ impl EditorState {
         let cols = cols as u32;
         let rows = expanded_images.len().div_ceil(cols as usize) as u32;
 
-        let mut spritesheet = DynamicImage::new_rgba8(cols as u32 * image_bb_width, rows as u32 * image_bb_height);
+        let mut spritesheet =
+            DynamicImage::new_rgba8(cols as u32 * image_bb_width, rows as u32 * image_bb_height);
         let spritesheet_pixels = spritesheet.as_mut_rgba8().unwrap();
-        
+
         for ix in 0..cols {
             for iy in 0..rows {
                 let index = (iy * cols + ix) as usize;
@@ -306,14 +363,221 @@ impl EditorState {
             }
         }
 
-        spritesheet.save(format!("{}.all.png", path.as_ref().to_string_lossy())).unwrap();
+        spritesheet
+            .save(format!("{}.all.png", path.as_ref().to_string_lossy()))
+            .unwrap();
 
-        let value = serde_json::Value::Array(expanded_images.into_iter().map(|a| serde_json::Value::Object([("x".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(a.1.x as _).unwrap())), ("y".to_string(), serde_json::Value::Number(serde_json::Number::from_f64(a.1.y as _).unwrap()))].into_iter().collect())).collect());
-        std::fs::write(format!("{}.json", path.as_ref().to_string_lossy()), serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        let frame_data = SpritesheetInfo {
+            cell_width: image_bb_width as _,
+            cell_height: image_bb_height as _,
+            columns: cols as _,
+            frame_count: expanded_images.len(),
+            frame_data: expanded_images
+                .into_iter()
+                .map(|(_, offset, delay)| FrameData {
+                    delay,
+                    origin: offset,
+                    root_motion: Vec2::ZERO,
+                    hitboxes: (),
+                })
+                .collect(),
+        };
+
+        serde_json::to_writer_pretty(
+            std::fs::File::create(format!("{}.json", path.as_ref().to_string_lossy())).unwrap(),
+            &frame_data,
+        )
+        .unwrap();
+
+        let mut bytes = vec![];
+        let mut cursor = Cursor::new(&mut bytes);
+        spritesheet.write_to(&mut cursor, ImageFormat::Png).unwrap();
+
+        let animation_file_data = AnimationFileData {
+            spritesheet: bytes,
+            spritesheet_info: frame_data
+        };
+
+        serde_json::to_writer_pretty(
+            std::fs::File::create(format!("{}.anim.json", path.as_ref().to_string_lossy())).unwrap(),
+            &animation_file_data,
+        )
+        .unwrap();
+    }
+
+    fn load(&mut self, path: impl AsRef<Path>, assets: &mut Assets<Image>) {
+        self.current_animation = load(&path, assets);
+        self.current_frame = 0;
+        self.current_basepath = Some(path.as_ref().to_string_lossy().to_string());
+        self.action_list = vec![];
+    }
+
+    fn do_action(&mut self, action: Action) {
+        for _ in 0..self.undo_depth {
+            self.action_list.pop().unwrap();
+        }
+        self.undo_depth = 0;
+        action.apply(self);
+        self.action_list.push(action);
+    }
+
+    fn undo(&mut self) {
+        if self.undo_depth >= self.action_list.len() {
+            return;
+        }
+        self.undo_depth += 1;
+        let action = self.action_list[self.action_list.len() - self.undo_depth].clone();
+        action.reverse(self);
+    }
+
+    fn redo(&mut self) {
+        if self.undo_depth == 0 {
+            return;
+        }
+
+        let action = self.action_list[self.action_list.len() - self.undo_depth].clone();
+        action.apply(self);
+        self.undo_depth -= 1;
+    }
+}
+
+#[derive(Clone)]
+enum Action {
+    RemoveFrame {
+        frame: Frame,
+        index: usize,
+    },
+    AddFrame {
+        image: Handle<Image>,
+    },
+    MoveSprite {
+        frame_index: usize,
+        from: Vec2,
+        to: Vec2,
+    }
+}
+
+impl Action {
+    fn apply(&self, state: &mut EditorState) {
+        match self {
+            Action::RemoveFrame { frame, index } => {
+                let removed_frame = state.current_animation.timeline.frames.remove(*index);
+                assert!(*frame == removed_frame);
+                if *index < state.current_frame {
+                    state.current_frame -= 1;
+                }
+                if state.current_frame >= state.current_animation.timeline.frames.len() && state.current_frame != 0 {
+                    state.current_frame = state.current_animation.timeline.frames.len() - 1;
+                }
+            },
+            Action::AddFrame { image } => {
+                state.current_animation.timeline.frames.push(Frame {
+                    image: image.clone(),
+                    offset: Vec2::ZERO,
+                    delay: 1,
+                })
+            },
+            Action::MoveSprite { frame_index, from, to } => {
+                state.current_animation.timeline.frames[*frame_index].offset = *to;
+            },
+        }
+    }
+
+    fn reverse(&self, state: &mut EditorState) {
+        match self {
+            Action::RemoveFrame { frame, index } => {
+                state.current_animation.timeline.frames.insert(*index, frame.clone());
+                if state.current_frame >= *index && state.current_animation.timeline.frames.len() != 1 {
+                    state.current_frame += 1;
+                }
+            },
+            Action::AddFrame { image } => {
+                let frame = state.current_animation.timeline.frames.pop().unwrap();
+                assert!(frame.image == *image);
+                if state.current_frame >= state.current_animation.timeline.frames.len() && state.current_frame != 0 {
+                    state.current_frame = state.current_animation.timeline.frames.len() - 1;
+                }
+            },
+            Action::MoveSprite { frame_index, from, to } => {
+                state.current_animation.timeline.frames[*frame_index].offset = *from;
+            },
+        }
     }
 }
 
 #[derive(Serialize, Deserialize)]
+struct AnimationFileData {
+    #[serde(with = "seethe")]
+    spritesheet: Vec<u8>,
+    spritesheet_info: SpritesheetInfo
+}
+
+mod seethe {
+    use base64::Engine;
+    use serde::{Serializer, Deserializer, de::Visitor};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], mut s: S,) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes))
+        } else {
+            s.serialize_bytes(bytes)
+        }
+    }
+
+    pub(super) fn deserialize<'d, D: Deserializer<'d>>(mut d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+
+        impl Visitor<'_> for V {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("data")
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error, {
+                Ok(v)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error, {
+                Ok(v.into())
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error, {
+                Ok(base64::engine::general_purpose::STANDARD_NO_PAD.decode(v).unwrap())
+            }
+        }
+
+        if d.is_human_readable() {
+            d.deserialize_str(V)
+        } else {
+            d.deserialize_byte_buf(V)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SpritesheetInfo {
+    cell_width: usize,
+    cell_height: usize,
+    columns: usize,
+    frame_count: usize,
+    frame_data: Vec<FrameData>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FrameData {
+    delay: usize,
+    origin: Vec2,
+    root_motion: Vec2,
+    hitboxes: (),
+}
+
 struct Animation {
     timeline: Timeline,
 }
@@ -326,19 +590,17 @@ impl Animation {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Clone)]
 struct Frame {
-    image: ImageHandle,
+    image: Handle<Image>,
     offset: Vec2,
-    delay_since_last: usize,
+    delay: usize,
 }
 
-#[derive(Serialize, Deserialize)]
 struct Timeline {
     frames: Vec<Frame>,
 }
 
-#[derive(Serialize, Deserialize)]
 struct Hitbox {
     pos: Vec2,
     size: Vec2,
@@ -389,17 +651,19 @@ fn poll_pending_file_dialog(
                 Poll::Pending => {}
                 Poll::Ready(None) => {
                     pending_file_dialog.action = None;
-                } 
+                }
                 Poll::Ready(Some(val)) => {
                     pending_file_dialog.action = None;
                     for filename in val {
-                        let img = image::load_from_memory(&std::fs::read(filename.path()).unwrap()).unwrap();
+                        let img = image::load_from_memory(&std::fs::read(filename.path()).unwrap())
+                            .unwrap();
                         let handle = assets.add(Image::from_dynamic(img, true));
-                        add_frame(&mut commands, handle);
+                        let action = Action::AddFrame { image: handle };
+                        editor_state.do_action(action);
                     }
                 }
             }
-        },
+        }
         FileAction::Save(fut) => {
             struct DummyCtx;
 
@@ -456,15 +720,24 @@ fn interaction(
         camera_transform.translation.y -= delta.y * proj.scale;
     } else if let Some(frame) = frame {
         if mouse_input.pressed(MouseButton::Left) && delta.length_squared() != 0.0 {
+            let old_offset = frame.offset;
             frame.offset += delta * proj.scale;
+            if editor_state.drag_starting_pos.is_none() {
+                editor_state.drag_starting_pos = Some(old_offset);
+            }
         } else if mouse_input.just_released(MouseButton::Left) {
-            frame.offset.x = frame.offset.x.round();
-            frame.offset.y = frame.offset.y.round();
+            let offset = frame.offset.round();
+            let frame_index = editor_state.current_frame;
+            let from = editor_state.drag_starting_pos.unwrap_or(offset);
+            editor_state.do_action(Action::MoveSprite { frame_index, from, to: offset });
+            editor_state.drag_starting_pos = None;
         }
     }
 
     if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::F) {
-        pending_file_dialog.action = Some(FileAction::LoadFrame(Box::pin(rfd::AsyncFileDialog::new().pick_files())));
+        pending_file_dialog.action = Some(FileAction::LoadFrame(Box::pin(
+            rfd::AsyncFileDialog::new().pick_files(),
+        )));
     }
 
     if input.just_pressed(KeyCode::Left) {
@@ -477,8 +750,9 @@ fn interaction(
     }
 
     if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::Delete) {
-        let frame = editor_state.current_frame;
-        delete_frame(&mut commands, frame);
+        let index = editor_state.current_frame;
+        let frame = editor_state.current_animation.timeline.frames[index].clone();
+        editor_state.do_action(Action::RemoveFrame { frame, index });
     }
 
     if input.just_pressed(KeyCode::Plus) || input.just_pressed(KeyCode::NumpadAdd) {
@@ -494,6 +768,14 @@ fn interaction(
             .save_file();
         pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
     }
+
+    if input.pressed(KeyCode::LControl) && !input.pressed(KeyCode::LShift) && input.just_pressed(KeyCode::Z) {
+        editor_state.undo();
+    }
+
+    if input.pressed(KeyCode::LControl) && input.pressed(KeyCode::LShift) && input.just_pressed(KeyCode::Z) {
+        editor_state.redo();
+    }
 }
 
 fn add_frame(commands: &mut Commands, image: Handle<Image>) {
@@ -501,33 +783,10 @@ fn add_frame(commands: &mut Commands, image: Handle<Image>) {
         let mut editor_state = world.resource_mut::<EditorState>();
         let len = editor_state.current_animation.timeline.frames.len();
         editor_state.current_animation.timeline.frames.push(Frame {
-            image: ImageHandle {
-                path: "".into(),
-                image,
-            },
+            image,
             offset: Vec2::ZERO,
-            delay_since_last: 1,
+            delay: 1,
         });
-        // let mut q = world.query_filtered::<Entity, With<ScrollingList>>();
-        // let e = q.single(world);
-
-        // let frame_text = world
-        //     .spawn(
-        //         TextBundle::from_section(
-        //             format!("Frame {}", len + 1),
-        //             TextStyle {
-        //                 font: world
-        //                     .resource::<AssetServer>()
-        //                     .load("fonts/VT323-Regular.ttf"),
-        //                 font_size: 20.0,
-        //                 color: Color::WHITE,
-        //             },
-        //         )
-        //         .with_background_color(Color::GRAY),
-        //     )
-        //     .id();
-
-        // world.entity_mut(e).add_child(frame_text);
     });
 }
 
@@ -614,7 +873,7 @@ fn increase_delay(commands: &mut Commands) {
             return;
         }
 
-        editor_state.current_animation.timeline.frames[frame].delay_since_last += 1;
+        editor_state.current_animation.timeline.frames[frame].delay += 1;
     });
 }
 
@@ -627,9 +886,9 @@ fn decrease_delay(commands: &mut Commands) {
             return;
         }
 
-        editor_state.current_animation.timeline.frames[frame].delay_since_last =
+        editor_state.current_animation.timeline.frames[frame].delay =
             editor_state.current_animation.timeline.frames[frame]
-                .delay_since_last
+                .delay
                 .saturating_sub(1);
     });
 }
@@ -648,8 +907,8 @@ fn render(
     if let Some(frame) = frame {
         transform.translation.x = frame.offset.x;
         transform.translation.y = frame.offset.y;
-        if *img != frame.image.image {
-            *img = frame.image.image.clone();
+        if *img != frame.image {
+            *img = frame.image.clone();
         }
     } else {
         if *img != Handle::default() {

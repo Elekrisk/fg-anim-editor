@@ -396,7 +396,7 @@ fn update_frame_list(
                 format!(
                     "Frame {} [{}]",
                     i + 1,
-                    editor_state.current_animation.timeline.frames[i].delay_since_last
+                    editor_state.current_animation.timeline.frames[i].delay
                 ),
                 TextStyle {
                     font: asset_server.load("fonts/VT323-Regular.ttf"),
@@ -405,7 +405,7 @@ fn update_frame_list(
                 },
             ), FrameInfo {
                 frame: editor_state.current_frame,
-                delay: editor_state.current_animation.timeline.frames[i].delay_since_last,
+                delay: editor_state.current_animation.timeline.frames[i].delay,
             })).id();
             commands.entity(list).add_child(child);
         }
@@ -417,13 +417,13 @@ fn update_frame_list(
         let children = children.unwrap();
         let e = children[i];
         let (mut frameinfo, mut text) = entry_query.get_mut(e).unwrap();
-        if frameinfo.frame != i + 1 || frameinfo.delay != editor_state.current_animation.timeline.frames[editor_state.current_frame].delay_since_last {
+        if frameinfo.frame != i + 1 || frameinfo.delay != editor_state.current_animation.timeline.frames[i].delay {
             frameinfo.frame = i + 1;
-            frameinfo.delay = editor_state.current_animation.timeline.frames[editor_state.current_frame].delay_since_last;
+            frameinfo.delay = editor_state.current_animation.timeline.frames[i].delay;
             text.sections[0].value = format!(
                 "Frame {} [{}]",
                 i + 1,
-                editor_state.current_animation.timeline.frames[i].delay_since_last
+                editor_state.current_animation.timeline.frames[i].delay
             );
         }
     }
