@@ -8,16 +8,17 @@ mod ui;
 use std::{
     default::default,
     future::Future,
+    io::Cursor,
     path::{Path, PathBuf},
     pin::Pin,
-    task::{Context, Poll}, io::Cursor,
+    task::{Context, Poll},
 };
 
 use bevy::{
     input::keyboard::KeyboardInput,
     prelude::*,
     render::render_resource::Extent3d,
-    sprite::{Sprite, SpriteBundle},
+    sprite::{Sprite, SpriteBundle, Anchor},
     text::TextStyle,
     ui::{JustifyContent, Size, Style, UiRect, Val},
     window::{PrimaryWindow, Window},
@@ -42,7 +43,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugin(ShapePlugin)
         .add_startup_system(start)
-        .add_systems((mouse_delta, poll_pending_file_dialog, interaction, render));
+        .add_systems((mouse_delta.before(interaction), poll_pending_file_dialog, interaction, render.after(interaction)));
     ui::add_systems(&mut app);
 
     app.run();
@@ -63,7 +64,14 @@ fn start(
 
     build_ui(&mut commands, &asset_server);
 
-    commands.spawn(SpriteBundle { ..default() });
+    commands.spawn(SpriteBundle {
+        texture: Handle::default(),
+        sprite: Sprite {
+            anchor: Anchor::TopLeft,
+            ..default()
+        },
+        ..default()
+    });
 
     let line = shapes::Line(
         Vec2 {
@@ -143,7 +151,8 @@ fn start(
 }
 
 fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
-    let mut animation_file_data: AnimationFileData = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+    let animation_file_data: AnimationFileData =
+        serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
 
     let cell_width = animation_file_data.spritesheet_info.cell_width as u32;
     let cell_height = animation_file_data.spritesheet_info.cell_height as u32;
@@ -151,18 +160,23 @@ fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
     let frame_count = animation_file_data.spritesheet_info.frame_count as u32;
 
     let image = image::load_from_memory(&animation_file_data.spritesheet).unwrap();
-    
+
     let mut frames = vec![];
 
     for i in 0..frame_count {
         let x = i % cols;
         let y = i / cols;
 
-        let handle = assets.add(Image::from_dynamic(image.crop_imm(x * cell_width, y * cell_width, cell_width, cell_height), true));
+        let handle = assets.add(Image::from_dynamic(
+            image.crop_imm(x * cell_width, y * cell_height, cell_width, cell_height),
+            true,
+        ));
         let frame_info = &animation_file_data.spritesheet_info.frame_data[i as usize];
+        println!("{}", frame_info.origin);
         let offset = frame_info.origin;
+        println!("{}", offset);
         let delay = frame_info.delay;
-        
+
         frames.push(Frame {
             image: handle,
             offset,
@@ -171,9 +185,7 @@ fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
     }
 
     Animation {
-        timeline: Timeline {
-            frames
-        }
+        timeline: Timeline { frames },
     }
 }
 
@@ -395,7 +407,7 @@ impl EditorState {
 
         let animation_file_data = AnimationFileData {
             spritesheet: bytes,
-            spritesheet_info: frame_data
+            spritesheet_info: frame_data,
         };
 
         serde_json::to_writer_pretty(
@@ -403,6 +415,11 @@ impl EditorState {
             &animation_file_data,
         )
         .unwrap();
+        // std::fs::write(
+        //     format!("{}.anim.bincode", path.as_ref().to_string_lossy()),
+        //     bincode::serialize(&animation_file_data).unwrap(),
+        // )
+        // .unwrap();
     }
 
     fn load(&mut self, path: impl AsRef<Path>, assets: &mut Assets<Image>) {
@@ -454,7 +471,7 @@ enum Action {
         frame_index: usize,
         from: Vec2,
         to: Vec2,
-    }
+    },
 }
 
 impl Action {
@@ -466,41 +483,58 @@ impl Action {
                 if *index < state.current_frame {
                     state.current_frame -= 1;
                 }
-                if state.current_frame >= state.current_animation.timeline.frames.len() && state.current_frame != 0 {
+                if state.current_frame >= state.current_animation.timeline.frames.len()
+                    && state.current_frame != 0
+                {
                     state.current_frame = state.current_animation.timeline.frames.len() - 1;
                 }
-            },
-            Action::AddFrame { image } => {
-                state.current_animation.timeline.frames.push(Frame {
-                    image: image.clone(),
-                    offset: Vec2::ZERO,
-                    delay: 1,
-                })
-            },
-            Action::MoveSprite { frame_index, from, to } => {
+            }
+            Action::AddFrame { image } => state.current_animation.timeline.frames.push(Frame {
+                image: image.clone(),
+                offset: Vec2::ZERO,
+                delay: 1,
+            }),
+            Action::MoveSprite {
+                frame_index,
+                from,
+                to,
+            } => {
                 state.current_animation.timeline.frames[*frame_index].offset = *to;
-            },
+                println!("{to}");
+            }
         }
     }
 
     fn reverse(&self, state: &mut EditorState) {
         match self {
             Action::RemoveFrame { frame, index } => {
-                state.current_animation.timeline.frames.insert(*index, frame.clone());
-                if state.current_frame >= *index && state.current_animation.timeline.frames.len() != 1 {
+                state
+                    .current_animation
+                    .timeline
+                    .frames
+                    .insert(*index, frame.clone());
+                if state.current_frame >= *index
+                    && state.current_animation.timeline.frames.len() != 1
+                {
                     state.current_frame += 1;
                 }
-            },
+            }
             Action::AddFrame { image } => {
                 let frame = state.current_animation.timeline.frames.pop().unwrap();
                 assert!(frame.image == *image);
-                if state.current_frame >= state.current_animation.timeline.frames.len() && state.current_frame != 0 {
+                if state.current_frame >= state.current_animation.timeline.frames.len()
+                    && state.current_frame != 0
+                {
                     state.current_frame = state.current_animation.timeline.frames.len() - 1;
                 }
-            },
-            Action::MoveSprite { frame_index, from, to } => {
+            }
+            Action::MoveSprite {
+                frame_index,
+                from,
+                to,
+            } => {
                 state.current_animation.timeline.frames[*frame_index].offset = *from;
-            },
+            }
         }
     }
 }
@@ -509,14 +543,14 @@ impl Action {
 struct AnimationFileData {
     #[serde(with = "seethe")]
     spritesheet: Vec<u8>,
-    spritesheet_info: SpritesheetInfo
+    spritesheet_info: SpritesheetInfo,
 }
 
 mod seethe {
     use base64::Engine;
-    use serde::{Serializer, Deserializer, de::Visitor};
+    use serde::{de::Visitor, Deserializer, Serializer};
 
-    pub(super) fn serialize<S: Serializer>(bytes: &[u8], mut s: S,) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], mut s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
             s.serialize_str(&base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes))
         } else {
@@ -535,21 +569,26 @@ mod seethe {
             }
 
             fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-                where
-                    E: serde::de::Error, {
+            where
+                E: serde::de::Error,
+            {
                 Ok(v)
             }
 
             fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-                where
-                    E: serde::de::Error, {
+            where
+                E: serde::de::Error,
+            {
                 Ok(v.into())
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-                where
-                    E: serde::de::Error, {
-                Ok(base64::engine::general_purpose::STANDARD_NO_PAD.decode(v).unwrap())
+            where
+                E: serde::de::Error,
+            {
+                Ok(base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(v)
+                    .unwrap())
             }
         }
 
@@ -632,6 +671,7 @@ struct PendingFileDialog {
 enum FileAction {
     LoadFrame(Pin<Box<dyn Future<Output = Option<Vec<FileHandle>>>>>),
     Save(Pin<Box<dyn Future<Output = Option<FileHandle>>>>),
+    Open(Pin<Box<dyn Future<Output = Option<FileHandle>>>>),
 }
 
 fn poll_pending_file_dialog(
@@ -643,11 +683,12 @@ fn poll_pending_file_dialog(
     if pending_file_dialog.action.is_none() {
         return;
     }
+    let waker = futures::task::noop_waker_ref();
+    let ctx = &mut Context::from_waker(waker);
 
     match pending_file_dialog.action.as_mut().unwrap() {
         FileAction::LoadFrame(fut) => {
-            let waker = futures::task::noop_waker_ref();
-            match fut.as_mut().poll(&mut Context::from_waker(waker)) {
+            match fut.as_mut().poll(ctx) {
                 Poll::Pending => {}
                 Poll::Ready(None) => {
                     pending_file_dialog.action = None;
@@ -665,10 +706,7 @@ fn poll_pending_file_dialog(
             }
         }
         FileAction::Save(fut) => {
-            struct DummyCtx;
-
-            let waker = futures::task::noop_waker_ref();
-            match fut.as_mut().poll(&mut Context::from_waker(waker)) {
+            match fut.as_mut().poll(ctx) {
                 Poll::Pending => {}
                 Poll::Ready(None) => {
                     pending_file_dialog.action = None;
@@ -680,6 +718,19 @@ fn poll_pending_file_dialog(
                 }
             }
         }
+        FileAction::Open(fut) => {
+            match fut.as_mut().poll(ctx) {
+                Poll::Pending => {}
+                Poll::Ready(None) => {
+                    pending_file_dialog.action = None;
+                }
+                Poll::Ready(Some(val)) => {
+                    pending_file_dialog.action = None;
+                    let filename = val;
+                    editor_state.load(filename.path(), &mut assets);
+                }
+            }
+        },
     }
 }
 
@@ -721,7 +772,7 @@ fn interaction(
     } else if let Some(frame) = frame {
         if mouse_input.pressed(MouseButton::Left) && delta.length_squared() != 0.0 {
             let old_offset = frame.offset;
-            frame.offset += delta * proj.scale;
+            frame.offset -= delta * proj.scale;
             if editor_state.drag_starting_pos.is_none() {
                 editor_state.drag_starting_pos = Some(old_offset);
             }
@@ -729,7 +780,11 @@ fn interaction(
             let offset = frame.offset.round();
             let frame_index = editor_state.current_frame;
             let from = editor_state.drag_starting_pos.unwrap_or(offset);
-            editor_state.do_action(Action::MoveSprite { frame_index, from, to: offset });
+            editor_state.do_action(Action::MoveSprite {
+                frame_index,
+                from,
+                to: offset,
+            });
             editor_state.drag_starting_pos = None;
         }
     }
@@ -769,11 +824,22 @@ fn interaction(
         pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
     }
 
-    if input.pressed(KeyCode::LControl) && !input.pressed(KeyCode::LShift) && input.just_pressed(KeyCode::Z) {
+    if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::O) {
+        let future = rfd::AsyncFileDialog::new().add_filter("json", &["json"]).pick_file();
+        pending_file_dialog.action = Some(FileAction::Open(Box::pin(future)));
+    }
+
+    if input.pressed(KeyCode::LControl)
+        && !input.pressed(KeyCode::LShift)
+        && input.just_pressed(KeyCode::Z)
+    {
         editor_state.undo();
     }
 
-    if input.pressed(KeyCode::LControl) && input.pressed(KeyCode::LShift) && input.just_pressed(KeyCode::Z) {
+    if input.pressed(KeyCode::LControl)
+        && input.pressed(KeyCode::LShift)
+        && input.just_pressed(KeyCode::Z)
+    {
         editor_state.redo();
     }
 }
@@ -895,7 +961,8 @@ fn decrease_delay(commands: &mut Commands) {
 
 fn render(
     mut editor_state: ResMut<EditorState>,
-    mut sprite_query: Query<(&mut Transform, &mut Handle<Image>)>,
+    mut sprite_query: Query<(&mut Transform, &mut Handle<Image>, &mut Sprite)>,
+    assets: Res<Assets<Image>>,
 ) {
     let current_frame = editor_state.current_frame;
     let frame = editor_state
@@ -903,10 +970,17 @@ fn render(
         .timeline
         .frames
         .get_mut(current_frame);
-    let (mut transform, mut img) = sprite_query.single_mut();
+    let (mut transform, mut img, mut sprite) = sprite_query.single_mut();
     if let Some(frame) = frame {
-        transform.translation.x = frame.offset.x;
-        transform.translation.y = frame.offset.y;
+        // transform.translation.x = frame.offset.x;
+        // transform.translation.y = frame.offset.y;
+        if let Some(image) = assets.get(&img) {
+            let image_size = image.size();
+            sprite.anchor = Anchor::Custom((frame.offset / image_size) - Vec2::new(0.5, -0.5));
+            // println!("{:?}", sprite.anchor);
+        } else {
+            // println!("No");
+        }
         if *img != frame.image {
             *img = frame.image.clone();
         }
