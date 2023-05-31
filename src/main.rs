@@ -15,35 +15,87 @@ use std::{
 };
 
 use bevy::{
+    app::AppExit,
     input::keyboard::KeyboardInput,
     prelude::*,
     render::render_resource::Extent3d,
-    sprite::{Sprite, SpriteBundle, Anchor},
+    sprite::{Anchor, Sprite, SpriteBundle},
     text::TextStyle,
     ui::{JustifyContent, Size, Style, UiRect, Val},
-    window::{PrimaryWindow, Window},
+    window::{PrimaryWindow, Window, WindowCloseRequested},
     DefaultPlugins,
 };
+use bevy_egui::EguiPlugin;
 use bevy_prototype_lyon::prelude::*;
 use futures::io::BufWriter;
 use image::{DynamicImage, ImageFormat};
+use leafwing_input_manager::{
+    prelude::{ActionState, DualAxis, InputManagerPlugin, InputMap},
+    user_input::{InputKind, Modifier},
+    Actionlike, InputManagerBundle,
+};
 use rfd::FileHandle;
 use serde::{Deserialize, Serialize};
+use ui::UiState;
 
-use ui::{build_ui, ScrollingList, UiHandling};
+#[derive(Actionlike, Clone, Debug)]
+enum Input2 {
+    LeftClick,
+    Pan,
+    ToolSelect,
+    ToolMoveAnchor,
+    ToolCreateHitbox,
+    ToolCreateHurtbox,
+    ToolCreateCollisionbox,
+    New,
+    Open,
+    Save,
+    SaveAs,
+    AddFrame,
+    DeleteFrame,
+    DeleteSelected,
+    Undo,
+    Redo,
+    PrevFrame,
+    NextFrame,
+    TogglePlayback,
+}
 
 fn main() {
+    println!("{}", InteractionLock::All < InteractionLock::Playback);
+
     let mut app = App::new();
     app.insert_resource(EditorState::new())
         .insert_non_send_resource(PendingFileDialog { action: None })
         .insert_resource(Msaa::Off)
+        .insert_resource(InteractionLock::None)
         .insert_resource(LastMousePos(default()))
         .insert_resource(MouseDelta(default()))
-        .insert_resource(UiHandling::default())
-        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+        .add_plugins(
+            DefaultPlugins
+                .set(ImagePlugin::default_nearest())
+                .set(WindowPlugin {
+                    close_when_requested: false,
+                    ..default()
+                }),
+        )
+        .add_plugin(EguiPlugin)
         .add_plugin(ShapePlugin)
+        .add_plugin(InputManagerPlugin::<Input2>::default())
         .add_startup_system(start)
-        .add_systems((mouse_delta.before(interaction), poll_pending_file_dialog, interaction, render.after(interaction)));
+        .add_systems((
+            mouse_delta.before(mouse_interaction),
+            poll_pending_file_dialog,
+            // interaction,
+            mouse_interaction,
+            keyboard_interaction,
+            render.after(mouse_interaction),
+            exit_system,
+            on_close,
+        ));
+    app.get_schedule_mut(CoreSchedule::FixedUpdate)
+        .unwrap()
+        .add_system(animator);
     ui::add_systems(&mut app);
 
     app.run();
@@ -54,6 +106,46 @@ fn start(
     mut editor_state: ResMut<EditorState>,
     asset_server: Res<AssetServer>,
 ) {
+    let mut input_map = InputMap::default();
+    input_map.insert(MouseButton::Left, Input2::LeftClick);
+    input_map.insert(KeyCode::Space, Input2::Pan);
+    input_map.insert(KeyCode::S, Input2::ToolSelect);
+    input_map.insert(KeyCode::A, Input2::ToolMoveAnchor);
+    input_map.insert(KeyCode::H, Input2::ToolCreateHitbox);
+    input_map.insert(KeyCode::G, Input2::ToolCreateHurtbox);
+    input_map.insert(KeyCode::C, Input2::ToolCreateCollisionbox);
+    input_map.insert_modified(Modifier::Control, KeyCode::N, Input2::New);
+    input_map.insert_modified(Modifier::Control, KeyCode::O, Input2::Open);
+    input_map.insert_modified(Modifier::Control, KeyCode::S, Input2::Save);
+    input_map.insert_chord(
+        [
+            InputKind::from(Modifier::Control),
+            Modifier::Shift.into(),
+            KeyCode::S.into(),
+        ],
+        Input2::SaveAs,
+    );
+    input_map.insert(KeyCode::F, Input2::AddFrame);
+    input_map.insert(KeyCode::Delete, Input2::DeleteSelected);
+    input_map.insert_modified(Modifier::Control, KeyCode::Delete, Input2::DeleteFrame);
+    input_map.insert_modified(Modifier::Control, KeyCode::Z, Input2::Undo);
+    input_map.insert_chord(
+        [
+            InputKind::from(Modifier::Control),
+            Modifier::Shift.into(),
+            KeyCode::Z.into(),
+        ],
+        Input2::Redo,
+    );
+    input_map.insert(KeyCode::Left, Input2::PrevFrame);
+    input_map.insert(KeyCode::Right, Input2::NextFrame);
+    input_map.insert(KeyCode::K, Input2::TogglePlayback);
+
+    commands.spawn(InputManagerBundle::<Input2> {
+        action_state: default(),
+        input_map,
+    });
+
     commands.spawn(Camera2dBundle {
         projection: OrthographicProjection {
             scale: 0.1,
@@ -62,7 +154,7 @@ fn start(
         ..default()
     });
 
-    build_ui(&mut commands, &asset_server);
+    ui::build_ui(&mut commands);
 
     commands.spawn(SpriteBundle {
         texture: Handle::default(),
@@ -180,6 +272,7 @@ fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
         frames.push(Frame {
             image: handle,
             offset,
+            root_motion: Vec2::ZERO,
             delay,
         });
     }
@@ -204,6 +297,14 @@ struct EditorState {
     action_list: Vec<Action>,
     undo_depth: usize,
     drag_starting_pos: Option<Vec2>,
+    selected_tool: Tool,
+    currently_selected_box: Option<usize>,
+    has_saved: bool,
+    action_after_save: Option<Box<dyn FnOnce(&mut EditorState) + Send + Sync>>,
+    exit_now: bool,
+    with_pfd: Option<Box<dyn FnOnce(&mut PendingFileDialog) + Send + Sync>>,
+    animation_running: bool,
+    frames_since_last_frame: usize,
 }
 
 impl EditorState {
@@ -215,10 +316,45 @@ impl EditorState {
             action_list: vec![],
             undo_depth: 0,
             drag_starting_pos: None,
+            selected_tool: Tool::Select,
+            currently_selected_box: None,
+            has_saved: true,
+            action_after_save: None,
+            exit_now: false,
+            with_pfd: None,
+            animation_running: false,
+            frames_since_last_frame: 0,
         }
     }
 
-    fn save(&self, path: impl AsRef<Path>, assets: &Assets<Image>) {
+    fn confirm_if_unsaved(
+        &mut self,
+        ui_state: &mut UiState,
+        interaction_lock: &mut InteractionLock,
+        action: impl FnOnce(&mut Self) + Send + Sync + 'static,
+    ) {
+        if self.has_saved {
+            action(self);
+        } else {
+            self.animation_running = false;
+            *interaction_lock = InteractionLock::All;
+            ui_state.show_save_menu = true;
+            self.action_after_save = Some(Box::new(action));
+        }
+    }
+
+    fn save(&mut self, pending_file_dialog: &mut PendingFileDialog, assets: &Assets<Image>) {
+        if let Some(path) = self.current_basepath.clone() {
+            self.save_to(path, assets);
+        } else {
+            let future = rfd::AsyncFileDialog::new()
+                .add_filter("anim", &["anim"])
+                .save_file();
+            pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
+        }
+    }
+
+    fn save_to(&mut self, path: impl AsRef<Path>, assets: &Assets<Image>) {
         let images = self
             .current_animation
             .timeline
@@ -227,7 +363,7 @@ impl EditorState {
             .map(|ih| {
                 let img = assets.get(&ih.image).unwrap();
                 let img = img.clone().try_into_dynamic().unwrap();
-                let offset = ih.offset + Vec2::new(img.width() as _, img.height() as _) / 2.0;
+                let offset = ih.offset;
                 println!("{}", offset);
                 (img, offset, ih.delay)
             })
@@ -327,13 +463,13 @@ impl EditorState {
             ));
         }
 
-        for (index, (img, offset, delay)) in expanded_images.iter().enumerate() {
-            let mut path = PathBuf::from(path.as_ref());
-            let file_name = path.file_name().unwrap();
-            let new_file_name = format!("{}.{index}.png", file_name.to_string_lossy());
-            path.set_file_name(new_file_name);
-            img.save(path).unwrap();
-        }
+        // for (index, (img, offset, delay)) in expanded_images.iter().enumerate() {
+        //     let mut path = PathBuf::from(path.as_ref());
+        //     let file_name = path.file_name().unwrap();
+        //     let new_file_name = format!("{}.{index}.png", file_name.to_string_lossy());
+        //     path.set_file_name(new_file_name);
+        //     img.save(path).unwrap();
+        // }
 
         let mut cols = expanded_images.len();
 
@@ -375,9 +511,9 @@ impl EditorState {
             }
         }
 
-        spritesheet
-            .save(format!("{}.all.png", path.as_ref().to_string_lossy()))
-            .unwrap();
+        // spritesheet
+        //     .save(format!("{}.all.png", path.as_ref().to_string_lossy()))
+        //     .unwrap();
 
         let frame_data = SpritesheetInfo {
             cell_width: image_bb_width as _,
@@ -395,11 +531,11 @@ impl EditorState {
                 .collect(),
         };
 
-        serde_json::to_writer_pretty(
-            std::fs::File::create(format!("{}.json", path.as_ref().to_string_lossy())).unwrap(),
-            &frame_data,
-        )
-        .unwrap();
+        // serde_json::to_writer_pretty(
+        //     std::fs::File::create(format!("{}.json", path.as_ref().to_string_lossy())).unwrap(),
+        //     &frame_data,
+        // )
+        // .unwrap();
 
         let mut bytes = vec![];
         let mut cursor = Cursor::new(&mut bytes);
@@ -411,7 +547,7 @@ impl EditorState {
         };
 
         serde_json::to_writer_pretty(
-            std::fs::File::create(format!("{}.anim.json", path.as_ref().to_string_lossy())).unwrap(),
+            std::fs::File::create(path.as_ref().to_string_lossy().as_ref()).unwrap(),
             &animation_file_data,
         )
         .unwrap();
@@ -420,6 +556,12 @@ impl EditorState {
         //     bincode::serialize(&animation_file_data).unwrap(),
         // )
         // .unwrap();
+
+        self.has_saved = true;
+
+        if let Some(action) = self.action_after_save.take() {
+            action(self);
+        }
     }
 
     fn load(&mut self, path: impl AsRef<Path>, assets: &mut Assets<Image>) {
@@ -427,6 +569,7 @@ impl EditorState {
         self.current_frame = 0;
         self.current_basepath = Some(path.as_ref().to_string_lossy().to_string());
         self.action_list = vec![];
+        self.has_saved = true;
     }
 
     fn do_action(&mut self, action: Action) {
@@ -436,6 +579,8 @@ impl EditorState {
         self.undo_depth = 0;
         action.apply(self);
         self.action_list.push(action);
+
+        self.has_saved = false;
     }
 
     fn undo(&mut self) {
@@ -445,6 +590,8 @@ impl EditorState {
         self.undo_depth += 1;
         let action = self.action_list[self.action_list.len() - self.undo_depth].clone();
         action.reverse(self);
+
+        self.has_saved = false;
     }
 
     fn redo(&mut self) {
@@ -455,7 +602,61 @@ impl EditorState {
         let action = self.action_list[self.action_list.len() - self.undo_depth].clone();
         action.apply(self);
         self.undo_depth -= 1;
+
+        self.has_saved = false;
     }
+
+    fn get_frame(&self, index: usize) -> Option<&Frame> {
+        self.current_animation.timeline.frames.get(index)
+    }
+
+    fn get_frame_mut(&mut self, index: usize) -> Option<&mut Frame> {
+        self.current_animation.timeline.frames.get_mut(index)
+    }
+
+    fn frame(&self, index: usize) -> &Frame {
+        &self.current_animation.timeline.frames[index]
+    }
+
+    fn frame_mut(&mut self, index: usize) -> &mut Frame {
+        &mut self.current_animation.timeline.frames[index]
+    }
+}
+
+fn exit_system(editor_state: Res<EditorState>, mut close_events: EventWriter<AppExit>) {
+    if editor_state.exit_now {
+        close_events.send(AppExit);
+    }
+}
+
+fn on_close(
+    mut editor_state: ResMut<EditorState>,
+    mut ui_state: ResMut<UiState>,
+    mut interaction_lock: ResMut<InteractionLock>,
+    mut commands: Commands,
+    primary_window: Query<With<PrimaryWindow>>,
+    mut closed: EventReader<WindowCloseRequested>,
+) {
+    for event in closed.iter() {
+        if primary_window.get(event.window).is_err() || editor_state.has_saved {
+            commands.entity(event.window).despawn();
+        } else {
+            editor_state.animation_running = false;
+            editor_state.action_after_save = Some(Box::new(|es| es.exit_now = true));
+            ui_state.show_save_menu = true;
+            *interaction_lock = InteractionLock::All;
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum Tool {
+    Select,
+    MoveAnchor,
+    MoveRootMotion,
+    CreateHitbox,
+    CreateHurtbox,
+    MoveSelected,
 }
 
 #[derive(Clone)]
@@ -464,6 +665,11 @@ enum Action {
         frame: Frame,
         index: usize,
     },
+    ChangeDelay {
+        index: usize,
+        from: usize,
+        to: usize,
+    },
     AddFrame {
         image: Handle<Image>,
     },
@@ -471,6 +677,10 @@ enum Action {
         frame_index: usize,
         from: Vec2,
         to: Vec2,
+    },
+    SwapFrames {
+        a: usize,
+        b: usize,
     },
 }
 
@@ -492,6 +702,7 @@ impl Action {
             Action::AddFrame { image } => state.current_animation.timeline.frames.push(Frame {
                 image: image.clone(),
                 offset: Vec2::ZERO,
+                root_motion: Vec2::ZERO,
                 delay: 1,
             }),
             Action::MoveSprite {
@@ -500,7 +711,12 @@ impl Action {
                 to,
             } => {
                 state.current_animation.timeline.frames[*frame_index].offset = *to;
-                println!("{to}");
+            }
+            Action::ChangeDelay { index, from, to } => {
+                state.current_animation.timeline.frames[*index].delay = *to;
+            }
+            Action::SwapFrames { a, b } => {
+                state.current_animation.timeline.frames.swap(*a, *b);
             }
         }
     }
@@ -534,6 +750,12 @@ impl Action {
                 to,
             } => {
                 state.current_animation.timeline.frames[*frame_index].offset = *from;
+            }
+            Action::ChangeDelay { index, from, to } => {
+                state.current_animation.timeline.frames[*index].delay = *from;
+            }
+            Action::SwapFrames { a, b } => {
+                state.current_animation.timeline.frames.swap(*a, *b);
             }
         }
     }
@@ -633,6 +855,7 @@ impl Animation {
 struct Frame {
     image: Handle<Image>,
     offset: Vec2,
+    root_motion: Vec2,
     delay: usize,
 }
 
@@ -687,160 +910,233 @@ fn poll_pending_file_dialog(
     let ctx = &mut Context::from_waker(waker);
 
     match pending_file_dialog.action.as_mut().unwrap() {
-        FileAction::LoadFrame(fut) => {
-            match fut.as_mut().poll(ctx) {
-                Poll::Pending => {}
-                Poll::Ready(None) => {
-                    pending_file_dialog.action = None;
-                }
-                Poll::Ready(Some(val)) => {
-                    pending_file_dialog.action = None;
-                    for filename in val {
-                        let img = image::load_from_memory(&std::fs::read(filename.path()).unwrap())
-                            .unwrap();
-                        let handle = assets.add(Image::from_dynamic(img, true));
-                        let action = Action::AddFrame { image: handle };
-                        editor_state.do_action(action);
-                    }
+        FileAction::LoadFrame(fut) => match fut.as_mut().poll(ctx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => {
+                pending_file_dialog.action = None;
+            }
+            Poll::Ready(Some(val)) => {
+                pending_file_dialog.action = None;
+                for filename in val {
+                    let img =
+                        image::load_from_memory(&std::fs::read(filename.path()).unwrap()).unwrap();
+                    let handle = assets.add(Image::from_dynamic(img, true));
+                    let action = Action::AddFrame { image: handle };
+                    editor_state.do_action(action);
                 }
             }
-        }
-        FileAction::Save(fut) => {
-            match fut.as_mut().poll(ctx) {
-                Poll::Pending => {}
-                Poll::Ready(None) => {
-                    pending_file_dialog.action = None;
-                }
-                Poll::Ready(Some(val)) => {
-                    pending_file_dialog.action = None;
-                    let filename = val;
-                    editor_state.save(filename.path(), &assets);
-                }
+        },
+        FileAction::Save(fut) => match fut.as_mut().poll(ctx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => {
+                pending_file_dialog.action = None;
             }
-        }
-        FileAction::Open(fut) => {
-            match fut.as_mut().poll(ctx) {
-                Poll::Pending => {}
-                Poll::Ready(None) => {
-                    pending_file_dialog.action = None;
-                }
-                Poll::Ready(Some(val)) => {
-                    pending_file_dialog.action = None;
-                    let filename = val;
-                    editor_state.load(filename.path(), &mut assets);
-                }
+            Poll::Ready(Some(val)) => {
+                pending_file_dialog.action = None;
+                let filename = val;
+                editor_state.save_to(filename.path(), &assets);
+            }
+        },
+        FileAction::Open(fut) => match fut.as_mut().poll(ctx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => {
+                pending_file_dialog.action = None;
+            }
+            Poll::Ready(Some(val)) => {
+                pending_file_dialog.action = None;
+                let filename = val;
+                editor_state.load(filename.path(), &mut assets);
             }
         },
     }
 }
 
-fn interaction(
+#[derive(Resource, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InteractionLock {
+    None,
+    Playback,
+    All,
+}
+
+fn mouse_interaction(
+    delta: Res<MouseDelta>,
+    interaction_lock: Res<InteractionLock>,
+    primary_window: Query<&Window, With<PrimaryWindow>>,
+    input: Query<&ActionState<Input2>>,
     mut editor_state: ResMut<EditorState>,
-    mut pending_file_dialog: NonSendMut<PendingFileDialog>,
-    mut assets: ResMut<Assets<Image>>,
-    ui_handling: Res<UiHandling>,
-    mouse_delta: Res<MouseDelta>,
-    input: Res<Input<KeyCode>>,
-    mouse_input: Res<Input<MouseButton>>,
     mut query_camera: Query<(&mut Transform, &OrthographicProjection), With<Camera2d>>,
-    mut commands: Commands,
-    list_query: Query<&Children, With<ScrollingList>>,
 ) {
-    // println!("{}", ui_handling.is_pointer_over_ui);
-
-    if pending_file_dialog.action.is_some() {
+    if *interaction_lock == InteractionLock::All {
         return;
     }
 
-    if ui_handling.is_pointer_over_ui {
+    let input = input.single();
+    let mouse_pos = primary_window.single().cursor_position();
+
+    let delta = delta.0;
+    let index = editor_state.current_frame;
+
+    let (mut camera, mut proj) = query_camera.single_mut();
+
+    if input.pressed(Input2::Pan) {
+        camera.translation.x -= delta.x * proj.scale;
+        camera.translation.y -= delta.y * proj.scale;
+    }
+
+    if *interaction_lock >= InteractionLock::Playback {
         return;
     }
 
-    let delta = mouse_delta.0;
-
-    let current_frame = editor_state.current_frame;
-    let frame = editor_state
-        .current_animation
-        .timeline
-        .frames
-        .get_mut(current_frame);
-
-    let (mut camera_transform, proj) = query_camera.single_mut();
-    if input.pressed(KeyCode::Space) && delta.length_squared() != 0.0 {
-        camera_transform.translation.x -= delta.x * proj.scale;
-        camera_transform.translation.y -= delta.y * proj.scale;
-    } else if let Some(frame) = frame {
-        if mouse_input.pressed(MouseButton::Left) && delta.length_squared() != 0.0 {
-            let old_offset = frame.offset;
-            frame.offset -= delta * proj.scale;
-            if editor_state.drag_starting_pos.is_none() {
-                editor_state.drag_starting_pos = Some(old_offset);
+    if editor_state.get_frame(index).is_some() {
+        if input.just_pressed(Input2::LeftClick) {
+            match editor_state.selected_tool {
+                Tool::Select => {}
+                Tool::MoveAnchor => {
+                    editor_state.drag_starting_pos = Some(editor_state.frame(index).offset);
+                }
+                Tool::MoveRootMotion => {}
+                Tool::CreateHitbox => {}
+                Tool::CreateHurtbox => {}
+                Tool::MoveSelected => {}
             }
-        } else if mouse_input.just_released(MouseButton::Left) {
-            let offset = frame.offset.round();
-            let frame_index = editor_state.current_frame;
-            let from = editor_state.drag_starting_pos.unwrap_or(offset);
-            editor_state.do_action(Action::MoveSprite {
-                frame_index,
-                from,
-                to: offset,
-            });
-            editor_state.drag_starting_pos = None;
+        } else if input.pressed(Input2::LeftClick) {
+            match editor_state.selected_tool {
+                Tool::Select => {}
+                Tool::MoveAnchor => {
+                    if editor_state.drag_starting_pos.is_some() {
+                        editor_state.frame_mut(index).offset +=
+                            delta * proj.scale * Vec2::new(-1.0, 1.0);
+                    }
+                }
+                Tool::MoveRootMotion => {}
+                Tool::CreateHitbox => {}
+                Tool::CreateHurtbox => {}
+                Tool::MoveSelected => {}
+            }
+        } else if input.just_released(Input2::LeftClick) {
+            match editor_state.selected_tool {
+                Tool::Select => {}
+                Tool::MoveAnchor => {
+                    if let Some(from) = editor_state.drag_starting_pos {
+                        let action = Action::MoveSprite {
+                            frame_index: index,
+                            from,
+                            to: editor_state.frame(index).offset.round(),
+                        };
+                        editor_state.do_action(action);
+                    }
+                }
+                Tool::MoveRootMotion => {}
+                Tool::CreateHitbox => {}
+                Tool::CreateHurtbox => {}
+                Tool::MoveSelected => {}
+            }
+        }
+    }
+}
+
+fn keyboard_interaction(
+    mut interaction_lock: ResMut<InteractionLock>,
+    input: Query<&ActionState<Input2>>,
+    mut editor_state: ResMut<EditorState>,
+    mut ui_state: ResMut<UiState>,
+    mut pending_file_dialog: NonSendMut<PendingFileDialog>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+    assets: Res<Assets<Image>>,
+) {
+    if *interaction_lock == InteractionLock::All {
+        return;
+    }
+
+    let input = input.single();
+
+    if let Some(action) = editor_state.with_pfd.take() {
+        action(&mut pending_file_dialog);
+    }
+
+    if input.just_pressed(Input2::New) {
+        editor_state.confirm_if_unsaved(&mut ui_state, &mut interaction_lock, |es| {
+            es.current_animation = Animation::new();
+            es.current_frame = 0;
+            es.has_saved = true;
+            es.action_list = vec![];
+            es.undo_depth = 0;
+            es.action_after_save = None;
+            es.current_basepath = None;
+            es.currently_selected_box = None;
+            es.drag_starting_pos = None;
+        });
+    }
+    if input.just_pressed(Input2::Open) {
+        editor_state.confirm_if_unsaved(&mut ui_state, &mut interaction_lock, |es| {
+            es.with_pfd = Some(Box::new(|pfd: &mut PendingFileDialog| {
+                pfd.action = Some(FileAction::Open(Box::pin(
+                    rfd::AsyncFileDialog::new().pick_file(),
+                )));
+            }));
+        });
+    }
+    if input.just_pressed(Input2::Save) {
+        editor_state.save(&mut pending_file_dialog, &assets);
+    }
+    if input.just_pressed(Input2::SaveAs) {
+        let future = rfd::AsyncFileDialog::new()
+            .add_filter("anim", &["anim"])
+            .save_file();
+        pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
+    }
+    if input.just_pressed(Input2::ToolSelect) {
+        editor_state.selected_tool = Tool::Select;
+    }
+    if input.just_pressed(Input2::ToolMoveAnchor) {
+        editor_state.selected_tool = Tool::MoveAnchor;
+    }
+
+    if input.just_pressed(Input2::TogglePlayback) {
+        editor_state.animation_running = !editor_state.animation_running;
+        editor_state.frames_since_last_frame = 0;
+        if editor_state.animation_running {
+            *interaction_lock = InteractionLock::Playback;
+        } else {
+            *interaction_lock = InteractionLock::None;
         }
     }
 
-    if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::F) {
+    if *interaction_lock >= InteractionLock::Playback {
+        return;
+    }
+
+    if input.just_pressed(Input2::AddFrame) {
         pending_file_dialog.action = Some(FileAction::LoadFrame(Box::pin(
             rfd::AsyncFileDialog::new().pick_files(),
         )));
     }
-
-    if input.just_pressed(KeyCode::Left) {
-        let frame = editor_state.current_frame;
-        switch_to_frame(&mut commands, frame.saturating_sub(1));
+    if input.just_pressed(Input2::DeleteFrame) {
+        if let Some(frame) = editor_state.get_frame(editor_state.current_frame) {
+            let action = Action::RemoveFrame {
+                frame: frame.clone(),
+                index: editor_state.current_frame,
+            };
+            editor_state.do_action(action);
+        }
     }
-    if input.just_pressed(KeyCode::Right) {
-        let frame = editor_state.current_frame;
-        switch_to_frame(&mut commands, frame + 1);
-    }
-
-    if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::Delete) {
-        let index = editor_state.current_frame;
-        let frame = editor_state.current_animation.timeline.frames[index].clone();
-        editor_state.do_action(Action::RemoveFrame { frame, index });
-    }
-
-    if input.just_pressed(KeyCode::Plus) || input.just_pressed(KeyCode::NumpadAdd) {
-        increase_delay(&mut commands);
-    }
-    if input.just_pressed(KeyCode::Minus) || input.just_pressed(KeyCode::NumpadSubtract) {
-        decrease_delay(&mut commands);
-    }
-
-    if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::S) {
-        let future = rfd::AsyncFileDialog::new()
-            .add_filter("json", &["json"])
-            .save_file();
-        pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
-    }
-
-    if input.pressed(KeyCode::LControl) && input.just_pressed(KeyCode::O) {
-        let future = rfd::AsyncFileDialog::new().add_filter("json", &["json"]).pick_file();
-        pending_file_dialog.action = Some(FileAction::Open(Box::pin(future)));
-    }
-
-    if input.pressed(KeyCode::LControl)
-        && !input.pressed(KeyCode::LShift)
-        && input.just_pressed(KeyCode::Z)
-    {
+    if input.just_pressed(Input2::Undo) {
         editor_state.undo();
     }
-
-    if input.pressed(KeyCode::LControl)
-        && input.pressed(KeyCode::LShift)
-        && input.just_pressed(KeyCode::Z)
-    {
+    if input.just_pressed(Input2::Redo) {
         editor_state.redo();
+    }
+
+    if input.just_pressed(Input2::PrevFrame) {
+        if editor_state.current_frame > 0 {
+            editor_state.current_frame -= 1;
+        }
+    }
+
+    if input.just_pressed(Input2::NextFrame) {
+        if editor_state.current_frame + 1 < editor_state.current_animation.timeline.frames.len() {
+            editor_state.current_frame += 1;
+        }
     }
 }
 
@@ -851,6 +1147,7 @@ fn add_frame(commands: &mut Commands, image: Handle<Image>) {
         editor_state.current_animation.timeline.frames.push(Frame {
             image,
             offset: Vec2::ZERO,
+            root_motion: Vec2::ZERO,
             delay: 1,
         });
     });
@@ -874,22 +1171,22 @@ fn switch_to_frame_internal(world: &mut World, new_frame: usize) {
     let new_frame = new_frame.min(len - 1);
     editor_state.current_frame = new_frame;
 
-    let mut c = world.query_filtered::<&Children, With<ScrollingList>>();
-    let c = c.single(world);
+    // let mut c = world.query_filtered::<&Children, With<ScrollingList>>();
+    // let c = c.single(world);
 
-    let old = c[old_frame];
-    let new = c[new_frame];
+    // let old = c[old_frame];
+    // let new = c[new_frame];
 
-    world
-        .entity_mut(old)
-        .get_mut::<BackgroundColor>()
-        .unwrap()
-        .0 = Color::GRAY;
-    world
-        .entity_mut(new)
-        .get_mut::<BackgroundColor>()
-        .unwrap()
-        .0 = Color::DARK_GRAY;
+    // world
+    //     .entity_mut(old)
+    //     .get_mut::<BackgroundColor>()
+    //     .unwrap()
+    //     .0 = Color::GRAY;
+    // world
+    //     .entity_mut(new)
+    //     .get_mut::<BackgroundColor>()
+    //     .unwrap()
+    //     .0 = Color::DARK_GRAY;
 }
 
 fn delete_frame(commands: &mut Commands, frame: usize) {
@@ -976,7 +1273,9 @@ fn render(
         // transform.translation.y = frame.offset.y;
         if let Some(image) = assets.get(&img) {
             let image_size = image.size();
-            sprite.anchor = Anchor::Custom((frame.offset / image_size) - Vec2::new(0.5, -0.5));
+            sprite.anchor = Anchor::Custom(
+                ((frame.offset / image_size) - Vec2::new(0.5, 0.5)) * Vec2::new(1.0, -1.0),
+            );
             // println!("{:?}", sprite.anchor);
         } else {
             // println!("No");
@@ -988,5 +1287,34 @@ fn render(
         if *img != Handle::default() {
             *img = Handle::default();
         }
+    }
+}
+
+fn animator(mut editor_state: ResMut<EditorState>) {
+    if !editor_state.animation_running {
+        return;
+    }
+
+    if editor_state.current_animation.timeline.frames.is_empty() {
+        return;
+    }
+
+    if editor_state.get_frame(editor_state.current_frame).is_none() {
+        editor_state.current_frame = 0;
+    }
+
+    editor_state.frames_since_last_frame += 1;
+
+    let index = editor_state.current_frame;
+
+    let frame = editor_state.frame(index);
+
+    if editor_state.frames_since_last_frame >= frame.delay {
+        let mut new_index = index + 1;
+        if new_index >= editor_state.current_animation.timeline.frames.len() {
+            new_index = 0;
+        }
+        editor_state.current_frame = new_index;
+        editor_state.frames_since_last_frame = 0;
     }
 }

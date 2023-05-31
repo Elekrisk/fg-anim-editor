@@ -1,430 +1,305 @@
-use std::sync::atomic::AtomicI64;
+use std::{str::FromStr, sync::atomic::AtomicBool};
 
-use bevy::{
-    ecs::system::EntityCommands,
-    input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
-    prelude::*,
-    window::PrimaryWindow,
-};
+use bevy::{app::AppExit, prelude::*};
+use bevy_egui::EguiContexts;
+use egui::Context;
 
-use crate::EditorState;
+use crate::{Action, EditorState, InteractionLock, PendingFileDialog, Tool};
 
-pub fn build_ui(commands: &mut Commands, asset_server: &AssetServer) {
-    let wrapper = commands
-        .spawn(NodeBundle {
-            style: Style {
-                max_size: Size::all(Val::Percent(100.0)),
-                ..default()
-            },
-            // background_color: Color::rgba(1.0, 1.0, 1.0, 0.0).into(),
-            ..default()
-        })
-        .insert(Interaction::default())
-        .id();
-
-    scrollable(commands, wrapper, Direction::Vertical, |parent| {})
+pub(crate) fn build_ui(commands: &mut Commands) {}
+pub(crate) fn add_systems(app: &mut App) {
+    app.insert_resource(UiState::default());
+    app.add_systems((update_ui_state.before(ui), ui));
 }
 
-pub fn add_systems(app: &mut App) {
-    app.add_systems((check_ui_interaction, mouse_scroll, mouse_grab_scrollbar, update_frame_list));
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Horizontal,
-    Vertical,
-}
-
-fn scrollable(
-    commands: &mut Commands,
-    parent: Entity,
-    direction: Direction,
-    children: impl FnOnce(&mut ChildBuilder),
+fn ui(
+    mut commands: Commands,
+    mut editor_state: ResMut<EditorState>,
+    mut ui_state: ResMut<UiState>,
+    mut pending_file_dialog: NonSendMut<PendingFileDialog>,
+    mut contexts: EguiContexts,
+    mut interaction_lock: ResMut<InteractionLock>,
+    assets: Res<Assets<Image>>,
 ) {
-    let (dir, rev_dir) = match direction {
-        Direction::Horizontal => (FlexDirection::Row, FlexDirection::Column),
-        Direction::Vertical => (FlexDirection::Column, FlexDirection::Row),
-    };
+    let ctx = contexts.ctx_mut();
+    save_confirmation_window(
+        &mut commands,
+        ctx,
+        &mut editor_state,
+        &mut ui_state,
+        &mut interaction_lock,
+        &mut pending_file_dialog,
+        &assets,
+    );
 
-    // Scrollbar handle
-    let handle = commands
-        .spawn((
-            NodeBundle {
-                style: Style {
-                    size: Size::all(Val::Px(20.0)),
-                    ..default()
-                },
-                background_color: Color::BLACK.into(),
-                ..default()
-            },
-            ScrollingHandle {
-                direction,
-                position: 0.0,
-                last_mouse_pos: None,
-                list: Entity::PLACEHOLDER,
-            },
-            Interaction::default(),
-        ))
-        .id();
-
-    // Scrollbar
-    let scrollbar = commands
-        .spawn(NodeBundle {
-            style: Style {
-                size: match direction {
-                    Direction::Horizontal => Size::height(Val::Px(20.0)),
-                    Direction::Vertical => Size::width(Val::Px(20.0)),
-                },
-                align_self: AlignSelf::Stretch,
-                ..default()
-            },
-            background_color: Color::FUCHSIA.into(),
-            ..default()
-        })
-        .add_child(handle)
-        .id();
-
-    // Panel
-    let panel = commands
-        .spawn((
-            NodeBundle {
-                style: Style {
-                    flex_direction: dir,
-                    max_size: Size::all(Val::Undefined),
-                    ..default()
-                },
-                background_color: Color::LIME_GREEN.into(),
-                ..default()
-            },
-            ScrollingList {
-                direction,
-                position: 0.0,
-                handle,
-            },
-        ))
-        .with_children(children)
-        .id();
-
-    commands.add(move |world: &mut World| {
-        world
-            .entity_mut(handle)
-            .get_mut::<ScrollingHandle>()
-            .unwrap()
-            .list = panel;
+    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        ui.set_enabled(*interaction_lock <= InteractionLock::Playback);
+        toolbar(ui, &mut editor_state);
     });
 
-    // Wrapper
-    let wrapper = commands
-        .spawn(NodeBundle {
-            style: Style {
-                flex_direction: dir,
-                align_self: AlignSelf::Stretch,
-                overflow: Overflow::Hidden,
-                ..default()
-            },
-            background_color: Color::BISQUE.into(),
-            ..default()
-        })
-        .add_child(panel)
-        .id();
+    egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
+        ui.set_enabled(*interaction_lock <= InteractionLock::Playback);
+        timeline(&mut editor_state, ui);
+    });
+    egui::SidePanel::right("right_panel").show(ctx, |ui| {
+        ui.set_enabled(*interaction_lock <= InteractionLock::None);
+        frame_info(&mut editor_state, &mut ui_state, ui);
+    });
+}
 
-    // Container
-    let container = commands
-        .spawn(NodeBundle {
-            style: Style {
-                flex_direction: rev_dir,
-                max_size: Size::all(Val::Percent(100.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .push_children(&[wrapper, scrollbar])
-        .id();
+fn save_confirmation_window(
+    commands: &mut Commands,
+    ctx: &mut Context,
+    editor_state: &mut EditorState,
+    ui_state: &mut UiState,
+    interaction_lock: &mut InteractionLock,
+    pending_file_dialog: &mut PendingFileDialog,
+    assets: &Assets<Image>,
+) {
+    if ui_state.show_save_menu {
+        egui::Window::new("Save?")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("You have unsaved changes. Do you want to save?");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        editor_state.action_after_save = Some(Box::new(|es| es.exit_now = true));
+                        editor_state.save(pending_file_dialog, assets);
+                        ui_state.show_save_menu = false;
+                        *interaction_lock = InteractionLock::None;
+                    };
+                    if ui.button("Don't save").clicked() {
+                        if let Some(action) = editor_state.action_after_save.take() {
+                            action(editor_state);
+                        }
+                        ui_state.show_save_menu = false;
+                        *interaction_lock = InteractionLock::None;
+                    };
+                    if ui.button("Cancel").clicked() {
+                        ui_state.show_save_menu = false;
+                        *interaction_lock = InteractionLock::None;
+                    };
+                });
+            });
+    }
+}
 
-    commands.add(move |world: &mut World| {
-        world.entity_mut(parent).add_child(container);
+fn toolbar(ui: &mut egui::Ui, editor_state: &mut EditorState) {
+    ui.horizontal_centered(|ui| {
+        let mut button = |tool: Tool, msg: &str| {
+            if ui
+                .add_enabled(editor_state.selected_tool != tool, egui::Button::new(msg))
+                .clicked()
+            {
+                editor_state.selected_tool = tool;
+            }
+        };
+
+        button(Tool::Select, "Select");
+        button(Tool::MoveAnchor, "Move Anchor");
+        button(Tool::MoveRootMotion, "Move Root Motion");
+        button(Tool::CreateHitbox, "Create Hitbox");
+        button(Tool::CreateHurtbox, "Create Hurtbox");
+    });
+}
+
+fn timeline(editor_state: &mut EditorState, ui: &mut egui::Ui) {
+    ui.group(|ui| {
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for i in 0..editor_state.current_animation.timeline.frames.len() {
+                    if i != 0 {
+                        ui.separator();
+                    }
+
+                    ui.allocate_ui_with_layout(
+                        egui::Vec2::new(30.0, 100.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .add_enabled(
+                                    i != editor_state.current_frame,
+                                    egui::Button::new(format!("{}", i + 1))
+                                        .min_size(egui::Vec2::new(30.0, 0.0)),
+                                )
+                                .clicked()
+                            {
+                                editor_state.current_frame = i;
+                            };
+
+                            ui.label(format!(
+                                "[{}]",
+                                editor_state.current_animation.timeline.frames[i].delay
+                            ));
+                        },
+                    );
+                }
+            });
+        });
     });
 }
 
 #[derive(Resource, Default)]
-pub struct UiHandling {
-    pub is_pointer_over_ui: bool,
+pub struct UiState {
+    pub(crate) show_save_menu: bool,
+    frame_delay: Cached<usize>,
+    frame_offset_x: Cached<f32>,
+    frame_offset_y: Cached<f32>,
 }
 
-fn check_ui_interaction(
-    mut ui_handling: ResMut<UiHandling>,
-    interaction_query: Query<&Interaction, (With<Node>, Changed<Interaction>)>,
-) {
-    if interaction_query.iter().next().is_none() {
-        return;
-    }
-    ui_handling.is_pointer_over_ui = interaction_query
-        .iter()
-        .any(|i| matches!(i, Interaction::Clicked | Interaction::Hovered));
-    println!("{}", ui_handling.is_pointer_over_ui);
+struct Cached<T> {
+    cache: T,
+    val: String,
 }
 
-#[derive(Component)]
-pub struct ScrollingList {
-    direction: Direction,
-    position: f32,
-    handle: Entity,
-}
-
-#[derive(Component)]
-struct ScrollingHandle {
-    direction: Direction,
-    position: f32,
-    last_mouse_pos: Option<Vec2>,
-    list: Entity,
-}
-
-fn mouse_scroll(
-    mut mouse_wheel_events: EventReader<MouseWheel>,
-    mut query_list: Query<(&mut ScrollingList, &mut Style, &Parent, &Node)>,
-    mut query_handle: Query<(&mut Style, &mut ScrollingHandle, &Node), Without<ScrollingList>>,
-    query_node: Query<&Node>,
-) {
-    for mouse_wheel_event in mouse_wheel_events.iter() {
-        for (mut scrolling_list, mut style, parent, list_node) in &mut query_list {
-            let items_size = list_node.size();
-            let container_size = query_node.get(parent.get()).unwrap().size();
-
-            let dy = match mouse_wheel_event.unit {
-                MouseScrollUnit::Line => mouse_wheel_event.y * 20.,
-                MouseScrollUnit::Pixel => mouse_wheel_event.y,
-            };
-
-            let (mut handle_style, mut handle, handle_node) =
-                query_handle.get_mut(scrolling_list.handle).unwrap();
-            let handle_size = handle_node.size();
-
-            scroll_panel_by(
-                scrolling_list.direction,
-                dy,
-                container_size,
-                &mut scrolling_list,
-                &mut style,
-                items_size,
-                &mut handle,
-                &mut handle_style,
-                handle_size,
-            )
+impl<T: Default + ToString> Default for Cached<T> {
+    fn default() -> Self {
+        let cache = T::default();
+        Self {
+            val: cache.to_string(),
+            cache,
         }
     }
 }
 
-fn scroll_panel_by(
-    direction: Direction,
-    dy: f32,
-    container_size: Vec2,
-    panel: &mut ScrollingList,
-    panel_style: &mut Style,
-    panel_size: Vec2,
-    handle: &mut ScrollingHandle,
-    handle_style: &mut Style,
-    handle_size: Vec2,
-) {
-    let percentage = match direction {
-        Direction::Horizontal => panel.position - dy / panel_size.x,
-        Direction::Vertical => panel.position - dy / panel_size.y,
-    }
-    .clamp(0.0, 1.0);
-    //println!("{dy} : {} : {percentage}", panel_size.x);
-
-    scroll_panel_to(
-        direction,
-        percentage,
-        container_size,
-        panel,
-        panel_style,
-        panel_size,
-        handle,
-        handle_style,
-        handle_size,
-    )
-}
-
-fn scroll_panel_to(
-    direction: Direction,
-    percentage: f32,
-    container_size: Vec2,
-    panel: &mut ScrollingList,
-    panel_style: &mut Style,
-    panel_size: Vec2,
-    handle: &mut ScrollingHandle,
-    handle_style: &mut Style,
-    handle_size: Vec2,
-) {
-    let axis = |v: Vec2| match direction {
-        Direction::Horizontal => v.x,
-        Direction::Vertical => v.y,
-    };
-
-    panel.position = percentage;
-    handle.position = percentage;
-
-    let percentage = percentage.clamp(0.0, 1.0);
-
-    let max_panel_scroll = (axis(panel_size) - axis(container_size)).max(0.0);
-    let max_handle_scroll = (axis(container_size) - axis(handle_size)).max(0.0);
-
-    let panel_pixel_scroll = max_panel_scroll * percentage;
-    let handle_pixel_scroll = max_handle_scroll * percentage;
-
-    match direction {
-        Direction::Horizontal => {
-            panel_style.position.left = Val::Px(-panel_pixel_scroll);
-            handle_style.position.left = Val::Px(handle_pixel_scroll);
-        }
-        Direction::Vertical => {
-            panel_style.position.top = Val::Px(-panel_pixel_scroll);
-            handle_style.position.top = Val::Px(handle_pixel_scroll);
+impl<T: ToString + PartialEq + Clone> Cached<T> {
+    fn update(&mut self, t: &T) {
+        if self.cache != *t {
+            self.cache = t.clone();
+            self.val = t.to_string();
         }
     }
 }
 
-fn mouse_grab_scrollbar(
-    primary_window: Query<&Window, With<PrimaryWindow>>,
-    mut query_handle: Query<(
-        &mut Style,
-        &mut ScrollingHandle,
-        &Interaction,
-        &Parent,
-        &Node,
-    )>,
-    query_node: Query<&Node>,
-    mut query_list: Query<(&mut Style, &mut ScrollingList, &Node), Without<ScrollingHandle>>,
+fn update_ui_state(editor_state: Res<EditorState>, mut ui_state: ResMut<UiState>) {
+    if let Some(frame) = editor_state.get_frame(editor_state.current_frame) {
+        ui_state.frame_delay.update(&frame.delay);
+        ui_state.frame_offset_x.update(&frame.offset.x);
+        ui_state.frame_offset_y.update(&frame.offset.y);
+    }
+}
+
+fn cached_property_textbox<T: ToString + FromStr>(
+    ui: &mut egui::Ui,
+    property: &mut Cached<T>,
+    action: impl FnOnce(&T, T),
 ) {
-    static Y: AtomicI64 = AtomicI64::new(0);
-
-    let window = primary_window.single();
-    let Some(mouse_pos) = window.cursor_position() else {
-        return;
-    };
-
-    for (mut handle_style, mut handle, interaction, parent, node) in &mut query_handle {
-        if *interaction != Interaction::Clicked {
-            handle.last_mouse_pos = None;
-            handle.position = handle.position.clamp(0.0, 1.0);
-            continue;
-        }
-
-        let Some(last_mouse_pos) = handle.last_mouse_pos else {
-            handle.last_mouse_pos = Some(mouse_pos);
-            return;
-        };
-
-        let mut delta = mouse_pos - last_mouse_pos;
-        if delta.length_squared() == 0.0 {
-            continue;
-        }
-        delta.y *= -1.0;
-        handle.last_mouse_pos = Some(mouse_pos);
-
-        let y = Y.fetch_add(delta.y as i64, std::sync::atomic::Ordering::Relaxed);
-        // //println!("Y kept track of: {y}");
-
-        let handle_size = node.size();
-        let container_size = query_node.get(parent.get()).unwrap().size();
-        //println!("{container_size}");
-        let change_in_percent = match handle.direction {
-            Direction::Horizontal => delta.x / (container_size.x - handle_size.x),
-            Direction::Vertical => delta.y / (container_size.y - handle_size.y),
-        };
-
-        //println!("{} / {} = {}", delta.x, container_size.x, change_in_percent);
-
-        let new_pos = handle.position + change_in_percent;
-        //println!("{new_pos}");
-
-        let (mut panel_style, mut panel, panel_node) = query_list.get_mut(handle.list).unwrap();
-        let panel_size = panel_node.size();
-
-        scroll_panel_to(
-            handle.direction,
-            new_pos,
-            container_size,
-            &mut panel,
-            &mut panel_style,
-            panel_size,
-            &mut handle,
-            &mut handle_style,
-            handle_size,
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut property.val).min_size(egui::Vec2::new(50.0, 0.0)), // .desired_width(50.0),
         )
-    }
+        .lost_focus()
+    {
+        if let Ok(new_val) = property.val.parse::<T>() {
+            action(&property.cache, new_val);
+        }
+    };
 }
 
-#[derive(Component)]
-pub struct FrameInfo {
-    pub frame: usize,
-    pub delay: usize,
-}
-
-fn update_frame_list(
-    editor_state: Res<EditorState>,
-    list_query: Query<(Option<&Children>, Entity), With<ScrollingList>>,
-    mut entry_query: Query<(&mut FrameInfo, &mut Text)>,
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    if !editor_state.is_changed() {
-        println!("Editor state unchanged; skipping...");
+fn frame_info(editor_state: &mut EditorState, ui_state: &mut UiState, ui: &mut egui::Ui) {
+    let current_frame = editor_state.current_frame;
+    if editor_state.get_frame(current_frame).is_none() {
         return;
     }
 
-    let (children, list) = list_query.single();
-    let children_len = children.map(|c| c.len()).unwrap_or(0);
-    let len = editor_state.current_animation.timeline.frames.len();
+    egui::Grid::new("frame_info").num_columns(2).show(ui, |ui| {
+        ui.label("Frame number");
+        ui.label((current_frame + 1).to_string());
+        ui.end_row();
 
-    if children_len > len {
-        let children = children.unwrap();
-        commands
-            .get_entity(list)
-            .unwrap()
-            .remove_children(&children[len..]);
-        let to_remove = children[len..].to_vec();
-        commands.add(move |world: &mut World| {
-            for e in to_remove {
-                world.despawn(e);
-            }
+        ui.label("Duration");
+        cached_property_textbox(ui, &mut ui_state.frame_delay, |old_delay, new_delay| {
+            editor_state.do_action(Action::ChangeDelay {
+                index: current_frame,
+                from: *old_delay,
+                to: new_delay,
+            });
         });
-    }
-    if children_len < len {
-        for i in children_len..len {
-            let child = commands.spawn((TextBundle::from_section(
-                format!(
-                    "Frame {} [{}]",
-                    i + 1,
-                    editor_state.current_animation.timeline.frames[i].delay
-                ),
-                TextStyle {
-                    font: asset_server.load("fonts/VT323-Regular.ttf"),
-                    font_size: 20.0,
-                    color: Color::WHITE,
-                },
-            ), FrameInfo {
-                frame: editor_state.current_frame,
-                delay: editor_state.current_animation.timeline.frames[i].delay,
-            })).id();
-            commands.entity(list).add_child(child);
-        }
-    }
+        ui.end_row();
 
-    let ml = len.min(children_len);
+        ui.label("Offset");
 
-    for i in 0..ml {
-        let children = children.unwrap();
-        let e = children[i];
-        let (mut frameinfo, mut text) = entry_query.get_mut(e).unwrap();
-        if frameinfo.frame != i + 1 || frameinfo.delay != editor_state.current_animation.timeline.frames[i].delay {
-            frameinfo.frame = i + 1;
-            frameinfo.delay = editor_state.current_animation.timeline.frames[i].delay;
-            text.sections[0].value = format!(
-                "Frame {} [{}]",
-                i + 1,
-                editor_state.current_animation.timeline.frames[i].delay
-            );
-        }
-    }
+        egui::Grid::new("offset_grid")
+            .num_columns(2)
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                ui.label("X:");
+                cached_property_textbox(ui, &mut ui_state.frame_offset_x, |_, new_x| {
+                    let cur_offset = editor_state.frame(current_frame).offset;
+                    editor_state.do_action(Action::MoveSprite {
+                        frame_index: current_frame,
+                        from: cur_offset,
+                        to: Vec2::new(new_x, cur_offset.y),
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Y:");
+                cached_property_textbox(ui, &mut ui_state.frame_offset_y, |_, new_y| {
+                    let cur_offset = editor_state.frame(current_frame).offset;
+                    editor_state.do_action(Action::MoveSprite {
+                        frame_index: current_frame,
+                        from: cur_offset,
+                        to: Vec2::new(cur_offset.x, new_y),
+                    });
+                });
+                ui.end_row();
+            });
+        ui.end_row();
+
+        ui.label("Root motion");
+
+        egui::Grid::new("root_motion_grid")
+            .num_columns(2)
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                ui.label("X:");
+                cached_property_textbox(ui, &mut ui_state.frame_offset_x, |_, new_x| {
+                    let cur_offset = editor_state.frame(current_frame).offset;
+                    editor_state.do_action(Action::MoveSprite {
+                        frame_index: current_frame,
+                        from: cur_offset,
+                        to: Vec2::new(new_x, cur_offset.y),
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Y:");
+                cached_property_textbox(ui, &mut ui_state.frame_offset_y, |_, new_y| {
+                    let cur_offset = editor_state.frame(current_frame).offset;
+                    editor_state.do_action(Action::MoveSprite {
+                        frame_index: current_frame,
+                        from: cur_offset,
+                        to: Vec2::new(cur_offset.x, new_y),
+                    });
+                });
+                ui.end_row();
+            });
+        ui.end_row();
+
+        ui.add_enabled_ui(current_frame > 0, |ui| {
+            if ui.button("Move frame left").clicked() {
+                let action = Action::SwapFrames {
+                    a: current_frame,
+                    b: current_frame - 1,
+                };
+                editor_state.do_action(action);
+                editor_state.current_frame -= 1;
+            };
+        });
+        ui.add_enabled_ui(
+            current_frame + 1 < editor_state.current_animation.timeline.frames.len(),
+            |ui| {
+                if ui.button("Move frame right").clicked() {
+                    let action = Action::SwapFrames {
+                        a: current_frame,
+                        b: current_frame + 1,
+                    };
+                    editor_state.do_action(action);
+                    editor_state.current_frame += 1;
+                };
+            },
+        );
+        ui.end_row();
+    });
 }
