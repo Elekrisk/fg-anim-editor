@@ -2,10 +2,12 @@
 #![feature(let_chains)]
 #![feature(type_alias_impl_trait)]
 #![feature(int_roundings)]
+#![feature(hash_drain_filter)]
 
 mod ui;
 
 use std::{
+    collections::HashMap,
     default::default,
     future::Future,
     io::Cursor,
@@ -38,9 +40,16 @@ use rfd::FileHandle;
 use serde::{Deserialize, Serialize};
 use ui::UiState;
 
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+enum Stages {
+    Logic,
+    Ui,
+}
+
 #[derive(Actionlike, Clone, Debug)]
 enum Input2 {
     LeftClick,
+    ShiftLeftClick,
     Pan,
     ToolSelect,
     ToolMoveAnchor,
@@ -68,7 +77,6 @@ fn main() {
     app.insert_resource(EditorState::new())
         .insert_non_send_resource(PendingFileDialog { action: None })
         .insert_resource(Msaa::Off)
-        .insert_resource(InteractionLock::None)
         .insert_resource(LastMousePos(default()))
         .insert_resource(MouseDelta(default()))
         .add_plugins(
@@ -82,17 +90,20 @@ fn main() {
         .add_plugin(EguiPlugin)
         .add_plugin(ShapePlugin)
         .add_plugin(InputManagerPlugin::<Input2>::default())
+        .configure_set(Stages::Logic.before(Stages::Ui))
         .add_startup_system(start)
-        .add_systems((
-            mouse_delta.before(mouse_interaction),
-            poll_pending_file_dialog,
-            // interaction,
-            mouse_interaction,
-            keyboard_interaction,
-            render.after(mouse_interaction),
-            exit_system,
-            on_close,
-        ));
+        .add_systems(
+            (
+                mouse_delta.before(mouse_interaction),
+                poll_pending_file_dialog,
+                mouse_interaction,
+                keyboard_interaction,
+                render.after(mouse_interaction),
+                exit_system,
+                on_close,
+            )
+                .in_set(Stages::Logic),
+        );
     app.get_schedule_mut(CoreSchedule::FixedUpdate)
         .unwrap()
         .add_system(animator);
@@ -101,6 +112,9 @@ fn main() {
     app.run();
 }
 
+#[derive(Component)]
+struct MotionMarker;
+
 fn start(
     mut commands: Commands,
     mut editor_state: ResMut<EditorState>,
@@ -108,12 +122,13 @@ fn start(
 ) {
     let mut input_map = InputMap::default();
     input_map.insert(MouseButton::Left, Input2::LeftClick);
+    input_map.insert_modified(Modifier::Shift, MouseButton::Left, Input2::ShiftLeftClick);
     input_map.insert(KeyCode::Space, Input2::Pan);
-    input_map.insert(KeyCode::S, Input2::ToolSelect);
-    input_map.insert(KeyCode::A, Input2::ToolMoveAnchor);
-    input_map.insert(KeyCode::H, Input2::ToolCreateHitbox);
-    input_map.insert(KeyCode::G, Input2::ToolCreateHurtbox);
-    input_map.insert(KeyCode::C, Input2::ToolCreateCollisionbox);
+    input_map.insert(KeyCode::Q, Input2::ToolSelect);
+    input_map.insert(KeyCode::W, Input2::ToolMoveAnchor);
+    input_map.insert(KeyCode::E, Input2::ToolCreateHitbox);
+    input_map.insert(KeyCode::R, Input2::ToolCreateHurtbox);
+    input_map.insert(KeyCode::T, Input2::ToolCreateCollisionbox);
     input_map.insert_modified(Modifier::Control, KeyCode::N, Input2::New);
     input_map.insert_modified(Modifier::Control, KeyCode::O, Input2::Open);
     input_map.insert_modified(Modifier::Control, KeyCode::S, Input2::Save);
@@ -137,8 +152,8 @@ fn start(
         ],
         Input2::Redo,
     );
-    input_map.insert(KeyCode::Left, Input2::PrevFrame);
-    input_map.insert(KeyCode::Right, Input2::NextFrame);
+    input_map.insert(KeyCode::A, Input2::PrevFrame);
+    input_map.insert(KeyCode::D, Input2::NextFrame);
     input_map.insert(KeyCode::K, Input2::TogglePlayback);
 
     commands.spawn(InputManagerBundle::<Input2> {
@@ -155,6 +170,31 @@ fn start(
     });
 
     ui::build_ui(&mut commands);
+
+    let mut shape = shapes::Polygon::default();
+    shape.points = vec![
+        Vec2::new(0.0, 1.0),
+        Vec2::new(1.0, 0.0),
+        Vec2::new(0.0, -1.0),
+        Vec2::new(-1.0, 0.0),
+    ];
+    shape.closed = true;
+
+    commands.spawn((
+        ShapeBundle {
+            path: GeometryBuilder::build_as(&shape),
+            transform: Transform {
+                translation: Vec3 {
+                    z: 1.0,
+                    ..default()
+                },
+                ..default()
+            },
+            ..default()
+        },
+        Fill::color(Color::YELLOW.with_a(0.5)),
+        MotionMarker,
+    ));
 
     commands.spawn(SpriteBundle {
         texture: Handle::default(),
@@ -246,10 +286,10 @@ fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
     let animation_file_data: AnimationFileData =
         serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
 
-    let cell_width = animation_file_data.spritesheet_info.cell_width as u32;
-    let cell_height = animation_file_data.spritesheet_info.cell_height as u32;
-    let cols = animation_file_data.spritesheet_info.columns as u32;
-    let frame_count = animation_file_data.spritesheet_info.frame_count as u32;
+    let cell_width = animation_file_data.info.cell_width as u32;
+    let cell_height = animation_file_data.info.cell_height as u32;
+    let cols = animation_file_data.info.columns as u32;
+    let frame_count = animation_file_data.info.frame_count as u32;
 
     let image = image::load_from_memory(&animation_file_data.spritesheet).unwrap();
 
@@ -263,22 +303,26 @@ fn load(path: impl AsRef<Path>, assets: &mut Assets<Image>) -> Animation {
             image.crop_imm(x * cell_width, y * cell_height, cell_width, cell_height),
             true,
         ));
-        let frame_info = &animation_file_data.spritesheet_info.frame_data[i as usize];
+        let frame_info = &animation_file_data.info.frame_data[i as usize];
         println!("{}", frame_info.origin);
         let offset = frame_info.origin;
         println!("{}", offset);
+        let root_motion = frame_info.root_motion;
+        let hitboxes = frame_info.hitboxes.clone();
         let delay = frame_info.delay;
 
         frames.push(Frame {
             image: handle,
             offset,
-            root_motion: Vec2::ZERO,
+            root_motion,
             delay,
+            hitboxes,
         });
     }
 
     Animation {
         timeline: Timeline { frames },
+        hitboxes: animation_file_data.info.hitboxes.clone(),
     }
 }
 
@@ -305,6 +349,9 @@ struct EditorState {
     with_pfd: Option<Box<dyn FnOnce(&mut PendingFileDialog) + Send + Sync>>,
     animation_running: bool,
     frames_since_last_frame: usize,
+    interaction_lock: InteractionLock,
+    always_show_root_motion: bool,
+    show_hitboxes: bool,
 }
 
 impl EditorState {
@@ -324,21 +371,26 @@ impl EditorState {
             with_pfd: None,
             animation_running: false,
             frames_since_last_frame: 0,
+            interaction_lock: InteractionLock::None,
+            always_show_root_motion: false,
+            show_hitboxes: true,
         }
     }
 
     fn confirm_if_unsaved(
         &mut self,
         ui_state: &mut UiState,
-        interaction_lock: &mut InteractionLock,
         action: impl FnOnce(&mut Self) + Send + Sync + 'static,
+        unlock_on_non_cancel: bool,
     ) {
         if self.has_saved {
             action(self);
         } else {
             self.animation_running = false;
-            *interaction_lock = InteractionLock::All;
+            self.frames_since_last_frame = 0;
+            self.interaction_lock.lock_all();
             ui_state.show_save_menu = true;
+            ui_state.save_menu_unlock_on_non_cancel = unlock_on_non_cancel;
             self.action_after_save = Some(Box::new(action));
         }
     }
@@ -350,12 +402,15 @@ impl EditorState {
             let future = rfd::AsyncFileDialog::new()
                 .add_filter("anim", &["anim"])
                 .save_file();
+            self.interaction_lock.lock_all();
+            self.animation_running = false;
+            self.frames_since_last_frame = 0;
             pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
         }
     }
 
     fn save_to(&mut self, path: impl AsRef<Path>, assets: &Assets<Image>) {
-        let images = self
+        let mut images = self
             .current_animation
             .timeline
             .frames
@@ -364,24 +419,19 @@ impl EditorState {
                 let img = assets.get(&ih.image).unwrap();
                 let img = img.clone().try_into_dynamic().unwrap();
                 let offset = ih.offset;
+                let root_motion = ih.root_motion;
+                let hitboxes = ih.hitboxes.clone();
                 println!("{}", offset);
-                (img, offset, ih.delay)
+                (img, offset, root_motion, hitboxes, ih.delay)
             })
             .collect::<Vec<_>>();
 
         let image_count = images.len();
 
-        let pre_min_image_width = images.iter().map(|(img, _, _)| img.width()).min();
-        let pre_max_image_width = images.iter().map(|(img, _, _)| img.width()).max();
-        let pre_min_image_height = images.iter().map(|(img, _, _)| img.height()).min();
-        let pre_max_image_height = images.iter().map(|(img, _, _)| img.height()).max();
-
         let mut image_bb_width = 0;
         let mut image_bb_height = 0;
 
-        let mut cropped_images = vec![];
-
-        for (image, offset, delay) in images {
+        for (image, offset, _, _, _) in &mut images {
             let pixels = image.as_rgba8().unwrap();
 
             let mut left = pixels.width();
@@ -410,19 +460,15 @@ impl EditorState {
 
             println!("{width}, {height}");
 
-            let cropped_image = image.crop_imm(left, top, width, height);
+            *image = image.crop_imm(left, top, width, height);
 
-            let new_offset = Vec2::new(offset.x - left as f32, offset.y - top as f32);
-            cropped_images.push((cropped_image, new_offset, delay));
-            println!("{new_offset}");
+            *offset = Vec2::new(offset.x - left as f32, offset.y - top as f32);
+            println!("{offset}");
 
             image_bb_width = image_bb_width.max(width);
             image_bb_height = image_bb_height.max(height);
         }
-
-        let mut expanded_images = vec![];
-
-        for (image, offset, delay) in cropped_images {
+        for (image, offset, _, _, _) in &mut images {
             let diff_x = image_bb_width - image.width();
             let diff_y = image_bb_height - image.height();
 
@@ -456,11 +502,8 @@ impl EditorState {
                 }
             }
 
-            expanded_images.push((
-                expanded_image,
-                offset + Vec2::new(pad_left as _, pad_top as _),
-                delay,
-            ));
+            *image = expanded_image;
+            *offset += Vec2::new(pad_left as _, pad_top as _);
         }
 
         // for (index, (img, offset, delay)) in expanded_images.iter().enumerate() {
@@ -471,10 +514,10 @@ impl EditorState {
         //     img.save(path).unwrap();
         // }
 
-        let mut cols = expanded_images.len();
+        let mut cols = images.len();
 
-        for c in (1..=expanded_images.len()).rev() {
-            let r = expanded_images.len().div_ceil(c);
+        for c in (1..=images.len()).rev() {
+            let r = images.len().div_ceil(c);
 
             let w = c * image_bb_width as usize;
             let h = r * image_bb_height as usize;
@@ -486,7 +529,7 @@ impl EditorState {
         }
 
         let cols = cols as u32;
-        let rows = expanded_images.len().div_ceil(cols as usize) as u32;
+        let rows = images.len().div_ceil(cols as usize) as u32;
 
         let mut spritesheet =
             DynamicImage::new_rgba8(cols as u32 * image_bb_width, rows as u32 * image_bb_height);
@@ -495,11 +538,11 @@ impl EditorState {
         for ix in 0..cols {
             for iy in 0..rows {
                 let index = (iy * cols + ix) as usize;
-                if index as usize >= expanded_images.len() {
+                if index as usize >= images.len() {
                     continue;
                 }
 
-                let original_pixels = expanded_images[index].0.as_rgba8().unwrap();
+                let original_pixels = images[index].0.as_rgba8().unwrap();
                 for lx in 0..image_bb_width {
                     for ly in 0..image_bb_height {
                         let tx = ix * image_bb_width + lx;
@@ -515,20 +558,21 @@ impl EditorState {
         //     .save(format!("{}.all.png", path.as_ref().to_string_lossy()))
         //     .unwrap();
 
-        let frame_data = SpritesheetInfo {
+        let frame_data = Info {
             cell_width: image_bb_width as _,
             cell_height: image_bb_height as _,
             columns: cols as _,
-            frame_count: expanded_images.len(),
-            frame_data: expanded_images
+            frame_count: images.len(),
+            frame_data: images
                 .into_iter()
-                .map(|(_, offset, delay)| FrameData {
+                .map(|(_, offset, root_motion, hitboxes, delay)| FrameData {
                     delay,
                     origin: offset,
-                    root_motion: Vec2::ZERO,
-                    hitboxes: (),
+                    root_motion,
+                    hitboxes,
                 })
                 .collect(),
+            hitboxes: self.current_animation.hitboxes.clone(),
         };
 
         // serde_json::to_writer_pretty(
@@ -543,7 +587,7 @@ impl EditorState {
 
         let animation_file_data = AnimationFileData {
             spritesheet: bytes,
-            spritesheet_info: frame_data,
+            info: frame_data,
         };
 
         serde_json::to_writer_pretty(
@@ -573,14 +617,16 @@ impl EditorState {
     }
 
     fn do_action(&mut self, action: Action) {
-        for _ in 0..self.undo_depth {
-            self.action_list.pop().unwrap();
-        }
-        self.undo_depth = 0;
-        action.apply(self);
-        self.action_list.push(action);
+        if action.warrants_action() {
+            for _ in 0..self.undo_depth {
+                self.action_list.pop().unwrap();
+            }
+            self.undo_depth = 0;
+            action.apply(self);
+            self.action_list.push(action);
 
-        self.has_saved = false;
+            self.has_saved = false;
+        }
     }
 
     fn undo(&mut self) {
@@ -632,7 +678,6 @@ fn exit_system(editor_state: Res<EditorState>, mut close_events: EventWriter<App
 fn on_close(
     mut editor_state: ResMut<EditorState>,
     mut ui_state: ResMut<UiState>,
-    mut interaction_lock: ResMut<InteractionLock>,
     mut commands: Commands,
     primary_window: Query<With<PrimaryWindow>>,
     mut closed: EventReader<WindowCloseRequested>,
@@ -644,12 +689,12 @@ fn on_close(
             editor_state.animation_running = false;
             editor_state.action_after_save = Some(Box::new(|es| es.exit_now = true));
             ui_state.show_save_menu = true;
-            *interaction_lock = InteractionLock::All;
+            editor_state.interaction_lock.lock_all();
         }
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Tool {
     Select,
     MoveAnchor,
@@ -678,10 +723,35 @@ enum Action {
         from: Vec2,
         to: Vec2,
     },
+    SetMotionOffset {
+        frame_index: usize,
+        from: Vec2,
+        to: Vec2,
+    },
     SwapFrames {
         a: usize,
         b: usize,
     },
+    CreateHitbox {
+        id: usize,
+        desc: String,
+    },
+    MoveHitbox {
+        frame_index: usize,
+        id: usize,
+        from: Vec2,
+        to: Vec2,
+    },
+    ResizeHitbox {
+        frame_index: usize,
+        id: usize,
+        from: Vec2,
+        to: Vec2,
+    },
+    ToggleHitboxEnabled {
+        frame_index: usize,
+        id: usize,
+    }
 }
 
 impl Action {
@@ -704,6 +774,7 @@ impl Action {
                 offset: Vec2::ZERO,
                 root_motion: Vec2::ZERO,
                 delay: 1,
+                hitboxes: HashMap::new(),
             }),
             Action::MoveSprite {
                 frame_index,
@@ -718,6 +789,46 @@ impl Action {
             Action::SwapFrames { a, b } => {
                 state.current_animation.timeline.frames.swap(*a, *b);
             }
+            Action::SetMotionOffset {
+                frame_index,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*frame_index].root_motion = *to;
+            }
+            Action::CreateHitbox { id, desc } => {
+                state.current_animation.hitboxes.insert(
+                    *id,
+                    Hitbox {
+                        id: *id,
+                        desc: desc.clone(),
+                        is_hurtbox: false,
+                    },
+                );
+            }
+            Action::MoveHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*index]
+                    .hitbox_mut(*id)
+                    .pos = *to;
+            }
+            Action::ResizeHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*index]
+                    .hitbox_mut(*id)
+                    .size = *to;
+            }
+            Action::ToggleHitboxEnabled { frame_index, id } => {
+                state.current_animation.timeline.frames[*frame_index].hitbox_mut(*id).enabled.toggle();
+            },
         }
     }
 
@@ -757,6 +868,72 @@ impl Action {
             Action::SwapFrames { a, b } => {
                 state.current_animation.timeline.frames.swap(*a, *b);
             }
+            Action::SetMotionOffset {
+                frame_index,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*frame_index].root_motion = *from;
+            }
+            Action::CreateHitbox { id, desc } => {
+                state.current_animation.hitboxes.remove(id);
+            }
+            Action::MoveHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*index]
+                    .hitbox_mut(*id)
+                    .pos = *from;
+            }
+            Action::ResizeHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => {
+                state.current_animation.timeline.frames[*index]
+                    .hitbox_mut(*id)
+                    .size = *from;
+            }
+            Action::ToggleHitboxEnabled { frame_index, id } => {
+                state.current_animation.timeline.frames[*frame_index].hitbox_mut(*id).enabled.toggle();
+            },
+        }
+    }
+
+    fn warrants_action(&self) -> bool {
+        match self {
+            Action::RemoveFrame { frame, index } => true,
+            Action::ChangeDelay { index, from, to } => from != to,
+            Action::AddFrame { image } => true,
+            Action::MoveSprite {
+                frame_index,
+                from,
+                to,
+            } => from != to,
+            Action::SetMotionOffset {
+                frame_index,
+                from,
+                to,
+            } => from != to,
+            Action::SwapFrames { a, b } => a != b,
+            Action::CreateHitbox { id, desc } => true,
+            Action::MoveHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => from != to,
+            Action::ResizeHitbox {
+                frame_index: index,
+                id,
+                from,
+                to,
+            } => from != to,
+            Action::ToggleHitboxEnabled { frame_index, id } => true,
         }
     }
 }
@@ -765,7 +942,7 @@ impl Action {
 struct AnimationFileData {
     #[serde(with = "seethe")]
     spritesheet: Vec<u8>,
-    spritesheet_info: SpritesheetInfo,
+    info: Info,
 }
 
 mod seethe {
@@ -823,12 +1000,13 @@ mod seethe {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SpritesheetInfo {
+struct Info {
     cell_width: usize,
     cell_height: usize,
     columns: usize,
     frame_count: usize,
     frame_data: Vec<FrameData>,
+    hitboxes: HashMap<usize, Hitbox>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -836,17 +1014,19 @@ struct FrameData {
     delay: usize,
     origin: Vec2,
     root_motion: Vec2,
-    hitboxes: (),
+    hitboxes: HashMap<usize, HitboxPos>,
 }
 
 struct Animation {
     timeline: Timeline,
+    hitboxes: HashMap<usize, Hitbox>,
 }
 
 impl Animation {
     fn new() -> Self {
         Self {
             timeline: Timeline { frames: vec![] },
+            hitboxes: HashMap::new(),
         }
     }
 }
@@ -857,15 +1037,52 @@ struct Frame {
     offset: Vec2,
     root_motion: Vec2,
     delay: usize,
+    hitboxes: HashMap<usize, HitboxPos>,
+}
+
+impl Frame {
+    fn has_hitbox(&self, id: usize) -> bool {
+        self.hitboxes.contains_key(&id)
+    }
+
+    fn hitbox(&self, id: usize) -> &HitboxPos {
+        self.hitboxes.get(&id).unwrap()
+    }
+
+    fn hitbox_mut(&mut self, id: usize) -> &mut HitboxPos {
+        self.hitboxes.get_mut(&id).unwrap()
+    }
+
+    fn get_hitbox(&self, id: usize) -> Option<&HitboxPos> {
+        self.hitboxes.get(&id)
+    }
+
+    fn get_hitbox_mut(&mut self, id: usize) -> Option<&mut HitboxPos> {
+        self.hitboxes.get_mut(&id)
+    }
+
+    fn is_hitbox_enabled(&self, id: usize) -> bool {
+        self.get_hitbox(id).is_some_and(|hp| hp.enabled)
+    }
 }
 
 struct Timeline {
     frames: Vec<Frame>,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
 struct Hitbox {
+    id: usize,
+    desc: String,
+    is_hurtbox: bool,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Serialize)]
+struct HitboxPos {
+    id: usize,
     pos: Vec2,
     size: Vec2,
+    enabled: bool,
 }
 
 #[derive(Resource)]
@@ -914,6 +1131,7 @@ fn poll_pending_file_dialog(
             Poll::Pending => {}
             Poll::Ready(None) => {
                 pending_file_dialog.action = None;
+                editor_state.interaction_lock.release();
             }
             Poll::Ready(Some(val)) => {
                 pending_file_dialog.action = None;
@@ -924,28 +1142,33 @@ fn poll_pending_file_dialog(
                     let action = Action::AddFrame { image: handle };
                     editor_state.do_action(action);
                 }
+                editor_state.interaction_lock.release();
             }
         },
         FileAction::Save(fut) => match fut.as_mut().poll(ctx) {
             Poll::Pending => {}
             Poll::Ready(None) => {
                 pending_file_dialog.action = None;
+                editor_state.interaction_lock.release();
             }
             Poll::Ready(Some(val)) => {
                 pending_file_dialog.action = None;
                 let filename = val;
                 editor_state.save_to(filename.path(), &assets);
+                editor_state.interaction_lock.release();
             }
         },
         FileAction::Open(fut) => match fut.as_mut().poll(ctx) {
             Poll::Pending => {}
             Poll::Ready(None) => {
                 pending_file_dialog.action = None;
+                editor_state.interaction_lock.release();
             }
             Poll::Ready(Some(val)) => {
                 pending_file_dialog.action = None;
                 let filename = val;
                 editor_state.load(filename.path(), &mut assets);
+                editor_state.interaction_lock.release();
             }
         },
     }
@@ -958,15 +1181,36 @@ enum InteractionLock {
     All,
 }
 
+impl InteractionLock {
+    fn lock_all(&mut self) {
+        *self = InteractionLock::All;
+    }
+
+    fn lock_playback(&mut self) {
+        *self = InteractionLock::Playback;
+    }
+
+    fn release(&mut self) {
+        *self = InteractionLock::None;
+    }
+}
+
 fn mouse_interaction(
     delta: Res<MouseDelta>,
-    interaction_lock: Res<InteractionLock>,
     primary_window: Query<&Window, With<PrimaryWindow>>,
     input: Query<&ActionState<Input2>>,
     mut editor_state: ResMut<EditorState>,
-    mut query_camera: Query<(&mut Transform, &OrthographicProjection), With<Camera2d>>,
+    mut query_camera: Query<
+        (
+            &mut Transform,
+            &Camera,
+            &GlobalTransform,
+            &OrthographicProjection,
+        ),
+        With<Camera2d>,
+    >,
 ) {
-    if *interaction_lock == InteractionLock::All {
+    if editor_state.interaction_lock == InteractionLock::All {
         return;
     }
 
@@ -976,46 +1220,100 @@ fn mouse_interaction(
     let delta = delta.0;
     let index = editor_state.current_frame;
 
-    let (mut camera, mut proj) = query_camera.single_mut();
+    let (mut camera, actual_camera, global_camera, mut proj) = query_camera.single_mut();
+
+    let world_pos = mouse_pos.and_then(|mp| actual_camera.viewport_to_world_2d(&global_camera, mp));
 
     if input.pressed(Input2::Pan) {
         camera.translation.x -= delta.x * proj.scale;
         camera.translation.y -= delta.y * proj.scale;
     }
 
-    if *interaction_lock >= InteractionLock::Playback {
+    if editor_state.interaction_lock >= InteractionLock::Playback {
         return;
     }
 
     if editor_state.get_frame(index).is_some() {
         if input.just_pressed(Input2::LeftClick) {
             match editor_state.selected_tool {
-                Tool::Select => {}
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if let Some(wp) = world_pos {
+                            let mut selected = false;
+                            for hp in editor_state.frame(index).hitboxes.values() {
+                                if wp.x >= hp.pos.x
+                                    && wp.x <= hp.pos.x + hp.size.x
+                                    && wp.y <= hp.pos.y
+                                    && wp.y >= hp.pos.y - hp.size.y
+                                {
+                                    editor_state.currently_selected_box = Some(hp.id);
+                                    selected = true;
+                                    break;
+                                }
+                            }
+
+                            if !selected {
+                                editor_state.currently_selected_box = None;
+                            } else {
+                                editor_state.drag_starting_pos = Some(
+                                    editor_state
+                                        .frame(index)
+                                        .hitbox(editor_state.currently_selected_box.unwrap())
+                                        .pos,
+                                );
+                            }
+                        }
+                    }
+                }
                 Tool::MoveAnchor => {
                     editor_state.drag_starting_pos = Some(editor_state.frame(index).offset);
                 }
-                Tool::MoveRootMotion => {}
+                Tool::MoveRootMotion => {
+                    editor_state.drag_starting_pos = Some(editor_state.frame(index).root_motion);
+                }
                 Tool::CreateHitbox => {}
                 Tool::CreateHurtbox => {}
                 Tool::MoveSelected => {}
             }
         } else if input.pressed(Input2::LeftClick) {
             match editor_state.selected_tool {
-                Tool::Select => {}
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if editor_state.drag_starting_pos.is_some() && let Some(id) = editor_state.currently_selected_box {
+                            editor_state.frame_mut(index).hitbox_mut(id).pos += delta * proj.scale;
+                        }
+                    }
+                }
                 Tool::MoveAnchor => {
                     if editor_state.drag_starting_pos.is_some() {
                         editor_state.frame_mut(index).offset +=
                             delta * proj.scale * Vec2::new(-1.0, 1.0);
                     }
                 }
-                Tool::MoveRootMotion => {}
+                Tool::MoveRootMotion => {
+                    if editor_state.drag_starting_pos.is_some() {
+                        editor_state.frame_mut(index).root_motion += delta * proj.scale;
+                    }
+                }
                 Tool::CreateHitbox => {}
                 Tool::CreateHurtbox => {}
                 Tool::MoveSelected => {}
             }
         } else if input.just_released(Input2::LeftClick) {
             match editor_state.selected_tool {
-                Tool::Select => {}
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if let Some(from) = editor_state.drag_starting_pos && let Some(id) = editor_state.currently_selected_box {
+                            let action = Action::MoveHitbox {
+                                frame_index: index,
+                                id,
+                                from,
+                                to: editor_state.frame(index).hitbox(id).pos.round(),
+                            };
+                            editor_state.do_action(action);
+                        }
+                    }
+                }
                 Tool::MoveAnchor => {
                     if let Some(from) = editor_state.drag_starting_pos {
                         let action = Action::MoveSprite {
@@ -1026,17 +1324,90 @@ fn mouse_interaction(
                         editor_state.do_action(action);
                     }
                 }
-                Tool::MoveRootMotion => {}
+                Tool::MoveRootMotion => {
+                    if let Some(from) = editor_state.drag_starting_pos {
+                        let action = Action::SetMotionOffset {
+                            frame_index: index,
+                            from,
+                            to: editor_state.frame(index).root_motion.round(),
+                        };
+                        editor_state.do_action(action);
+                    }
+                }
                 Tool::CreateHitbox => {}
                 Tool::CreateHurtbox => {}
                 Tool::MoveSelected => {}
+            }
+        } else if input.just_pressed(Input2::ShiftLeftClick) {
+            println!("{:?}", editor_state.selected_tool);
+            match editor_state.selected_tool {
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if let Some(wp) = world_pos {
+                            let mut selected = false;
+                            for hp in editor_state.frame(index).hitboxes.values() {
+                                if wp.x >= hp.pos.x
+                                    && wp.x <= hp.pos.x + hp.size.x
+                                    && wp.y <= hp.pos.y
+                                    && wp.y >= hp.pos.y - hp.size.y
+                                {
+                                    editor_state.currently_selected_box = Some(hp.id);
+                                    selected = true;
+                                    break;
+                                }
+                            }
+
+                            if !selected {
+                                editor_state.currently_selected_box = None;
+                            } else {
+                                editor_state.drag_starting_pos = Some(
+                                    editor_state
+                                        .frame(index)
+                                        .hitbox(editor_state.currently_selected_box.unwrap())
+                                        .size,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if input.pressed(Input2::ShiftLeftClick) {
+            match editor_state.selected_tool {
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if editor_state.drag_starting_pos.is_some() && let Some(id) = editor_state.currently_selected_box {
+                        editor_state.frame_mut(index).hitbox_mut(id).size += delta * proj.scale * Vec2::new(1.0, -1.0);
+                    }
+                    }
+                }
+                _ => {}
+            }
+        } else if input.just_released(Input2::ShiftLeftClick) {
+            match editor_state.selected_tool {
+                Tool::Select => {
+                    if editor_state.show_hitboxes {
+                        if let Some(from) = editor_state.drag_starting_pos && let Some(id) = editor_state.currently_selected_box {
+                        let action = Action::ResizeHitbox {
+                            frame_index: index,
+                            id,
+                            from,
+                            to: editor_state.frame(index).hitbox(id).size.round(),
+                        };
+                        editor_state.do_action(action);
+                    }
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
+#[derive(Component)]
+struct HitboxId(usize);
+
 fn keyboard_interaction(
-    mut interaction_lock: ResMut<InteractionLock>,
     input: Query<&ActionState<Input2>>,
     mut editor_state: ResMut<EditorState>,
     mut ui_state: ResMut<UiState>,
@@ -1044,37 +1415,46 @@ fn keyboard_interaction(
     primary_window: Query<Entity, With<PrimaryWindow>>,
     assets: Res<Assets<Image>>,
 ) {
-    if *interaction_lock == InteractionLock::All {
+    if let Some(action) = editor_state.with_pfd.take() {
+        action(&mut pending_file_dialog);
+    }
+
+    if editor_state.interaction_lock == InteractionLock::All {
         return;
     }
 
     let input = input.single();
 
-    if let Some(action) = editor_state.with_pfd.take() {
-        action(&mut pending_file_dialog);
-    }
-
     if input.just_pressed(Input2::New) {
-        editor_state.confirm_if_unsaved(&mut ui_state, &mut interaction_lock, |es| {
-            es.current_animation = Animation::new();
-            es.current_frame = 0;
-            es.has_saved = true;
-            es.action_list = vec![];
-            es.undo_depth = 0;
-            es.action_after_save = None;
-            es.current_basepath = None;
-            es.currently_selected_box = None;
-            es.drag_starting_pos = None;
-        });
+        editor_state.confirm_if_unsaved(
+            &mut ui_state,
+            |es| {
+                es.current_animation = Animation::new();
+                es.current_frame = 0;
+                es.has_saved = true;
+                es.action_list = vec![];
+                es.undo_depth = 0;
+                es.action_after_save = None;
+                es.current_basepath = None;
+                es.currently_selected_box = None;
+                es.drag_starting_pos = None;
+            },
+            true,
+        );
     }
     if input.just_pressed(Input2::Open) {
-        editor_state.confirm_if_unsaved(&mut ui_state, &mut interaction_lock, |es| {
-            es.with_pfd = Some(Box::new(|pfd: &mut PendingFileDialog| {
-                pfd.action = Some(FileAction::Open(Box::pin(
-                    rfd::AsyncFileDialog::new().pick_file(),
-                )));
-            }));
-        });
+        editor_state.confirm_if_unsaved(
+            &mut ui_state,
+            |es| {
+                es.interaction_lock.lock_all();
+                es.with_pfd = Some(Box::new(|pfd: &mut PendingFileDialog| {
+                    pfd.action = Some(FileAction::Open(Box::pin(
+                        rfd::AsyncFileDialog::new().pick_file(),
+                    )));
+                }));
+            },
+            false,
+        );
     }
     if input.just_pressed(Input2::Save) {
         editor_state.save(&mut pending_file_dialog, &assets);
@@ -1083,6 +1463,9 @@ fn keyboard_interaction(
         let future = rfd::AsyncFileDialog::new()
             .add_filter("anim", &["anim"])
             .save_file();
+        editor_state.animation_running = false;
+        editor_state.frames_since_last_frame = 0;
+        editor_state.interaction_lock.lock_all();
         pending_file_dialog.action = Some(FileAction::Save(Box::pin(future)));
     }
     if input.just_pressed(Input2::ToolSelect) {
@@ -1096,17 +1479,18 @@ fn keyboard_interaction(
         editor_state.animation_running = !editor_state.animation_running;
         editor_state.frames_since_last_frame = 0;
         if editor_state.animation_running {
-            *interaction_lock = InteractionLock::Playback;
+            editor_state.interaction_lock = InteractionLock::Playback;
         } else {
-            *interaction_lock = InteractionLock::None;
+            editor_state.interaction_lock = InteractionLock::None;
         }
     }
 
-    if *interaction_lock >= InteractionLock::Playback {
+    if editor_state.interaction_lock >= InteractionLock::Playback {
         return;
     }
 
     if input.just_pressed(Input2::AddFrame) {
+        editor_state.interaction_lock.lock_all();
         pending_file_dialog.action = Some(FileAction::LoadFrame(Box::pin(
             rfd::AsyncFileDialog::new().pick_files(),
         )));
@@ -1140,145 +1524,102 @@ fn keyboard_interaction(
     }
 }
 
-fn add_frame(commands: &mut Commands, image: Handle<Image>) {
-    commands.add(|world: &mut World| {
-        let mut editor_state = world.resource_mut::<EditorState>();
-        let len = editor_state.current_animation.timeline.frames.len();
-        editor_state.current_animation.timeline.frames.push(Frame {
-            image,
-            offset: Vec2::ZERO,
-            root_motion: Vec2::ZERO,
-            delay: 1,
-        });
-    });
-}
-
-fn switch_to_frame(commands: &mut Commands, new_frame: usize) {
-    commands.add(move |world: &mut World| {
-        switch_to_frame_internal(world, new_frame);
-    });
-}
-
-fn switch_to_frame_internal(world: &mut World, new_frame: usize) {
-    let mut editor_state = world.resource_mut::<EditorState>();
-    let len = editor_state.current_animation.timeline.frames.len();
-    if len == 0 {
-        editor_state.current_frame = 0;
-        return;
-    }
-    let cur_frame = editor_state.current_frame;
-    let old_frame = cur_frame.min(len - 1);
-    let new_frame = new_frame.min(len - 1);
-    editor_state.current_frame = new_frame;
-
-    // let mut c = world.query_filtered::<&Children, With<ScrollingList>>();
-    // let c = c.single(world);
-
-    // let old = c[old_frame];
-    // let new = c[new_frame];
-
-    // world
-    //     .entity_mut(old)
-    //     .get_mut::<BackgroundColor>()
-    //     .unwrap()
-    //     .0 = Color::GRAY;
-    // world
-    //     .entity_mut(new)
-    //     .get_mut::<BackgroundColor>()
-    //     .unwrap()
-    //     .0 = Color::DARK_GRAY;
-}
-
-fn delete_frame(commands: &mut Commands, frame: usize) {
-    commands.add(move |world: &mut World| {
-        let mut editor_state = world.resource_mut::<EditorState>();
-        let len = editor_state.current_animation.timeline.frames.len();
-        if len == 0 {
-            return;
-        }
-        let cur_frame = editor_state.current_frame;
-        let old_frame = cur_frame.min(len - 1);
-        if frame >= len {
-            return;
-        }
-        editor_state.current_animation.timeline.frames.remove(frame);
-
-        if frame == len - 1 && frame != 0 {
-            switch_to_frame_internal(world, frame - 1);
-        } else if frame == old_frame && frame != 0 {
-            switch_to_frame_internal(world, frame);
-        }
-
-        // let mut q = world.query_filtered::<Entity, With<ScrollingList>>();
-        // let e = q.single(world);
-        // let c: Vec<_> = world
-        //     .entity(e)
-        //     .get::<Children>()
-        //     .unwrap()
-        //     .iter()
-        //     .copied()
-        //     .collect();
-        // for i in frame + 1..len {
-        //     let e = c[i];
-        //     world.entity_mut(e).get_mut::<Text>().unwrap().sections[0].value = format!("Frame {i}");
-        // }
-        // world.entity_mut(e).remove_children(&[c[frame]]);
-        // world.despawn(c[frame]);
-    });
-}
-
-fn increase_delay(commands: &mut Commands) {
-    commands.add(move |world: &mut World| {
-        let mut editor_state = world.resource_mut::<EditorState>();
-        let len = editor_state.current_animation.timeline.frames.len();
-        let frame = editor_state.current_frame;
-        if frame >= len {
-            return;
-        }
-
-        editor_state.current_animation.timeline.frames[frame].delay += 1;
-    });
-}
-
-fn decrease_delay(commands: &mut Commands) {
-    commands.add(move |world: &mut World| {
-        let mut editor_state = world.resource_mut::<EditorState>();
-        let len = editor_state.current_animation.timeline.frames.len();
-        let frame = editor_state.current_frame;
-        if frame >= len {
-            return;
-        }
-
-        editor_state.current_animation.timeline.frames[frame].delay =
-            editor_state.current_animation.timeline.frames[frame]
-                .delay
-                .saturating_sub(1);
-    });
-}
-
 fn render(
     mut editor_state: ResMut<EditorState>,
     mut sprite_query: Query<(&mut Transform, &mut Handle<Image>, &mut Sprite)>,
+    mut marker_query: Query<&mut Transform, (With<MotionMarker>, Without<Sprite>)>,
+    mut hitbox_shapes: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut bevy_prototype_lyon::prelude::Path,
+            &mut HitboxId,
+        ),
+        (Without<MotionMarker>, Without<Sprite>),
+    >,
+    mut commands: Commands,
     assets: Res<Assets<Image>>,
 ) {
+    let current_tool = editor_state.selected_tool;
     let current_frame = editor_state.current_frame;
+    let always_show_root_motion = editor_state.always_show_root_motion;
+    let show_hitboxes = editor_state.show_hitboxes;
     let frame = editor_state
         .current_animation
         .timeline
         .frames
         .get_mut(current_frame);
+    let mut marker_transform = marker_query.single_mut();
     let (mut transform, mut img, mut sprite) = sprite_query.single_mut();
     if let Some(frame) = frame {
-        // transform.translation.x = frame.offset.x;
-        // transform.translation.y = frame.offset.y;
+        if current_tool == Tool::MoveRootMotion || always_show_root_motion {
+            transform.translation.x = frame.root_motion.x;
+            transform.translation.y = frame.root_motion.y;
+            marker_transform.translation.x = frame.root_motion.x;
+            marker_transform.translation.y = frame.root_motion.y;
+        } else {
+            transform.translation.x = 0.0;
+            transform.translation.y = 0.0;
+            marker_transform.translation.x = 0.0;
+            marker_transform.translation.y = 0.0;
+        }
+
+        let mut drawn_hitboxes = vec![];
+
+        for (e, mut hitbox_transform, mut shape, mut id) in hitbox_shapes.iter_mut() {
+            if let Some(hp) = frame.get_hitbox(id.0) && hp.enabled && show_hitboxes {
+                hitbox_transform.translation.x = hp.pos.x;
+                hitbox_transform.translation.y = hp.pos.y;
+                if current_tool == Tool::MoveRootMotion || always_show_root_motion {
+                    hitbox_transform.translation.x += frame.root_motion.x;
+                    hitbox_transform.translation.y += frame.root_motion.y;
+                }
+                *shape = GeometryBuilder::build_as(&{
+                    let mut rect = shapes::Rectangle::default();
+                    rect.origin = RectangleOrigin::TopLeft;
+                    rect.extents = hp.size;
+                    rect
+                });
+                drawn_hitboxes.push(id.0.clone());
+            } else {
+                commands.entity(e).despawn();
+            }
+        }
+
+        if show_hitboxes {
+            commands.spawn_batch(
+                frame
+                    .hitboxes
+                    .values()
+                    .filter(|hp| hp.enabled && !drawn_hitboxes.contains(&hp.id))
+                    .map(|hp| {
+                        (
+                            ShapeBundle {
+                                path: GeometryBuilder::build_as(&{
+                                    let mut rect = shapes::Rectangle::default();
+                                    rect.origin = RectangleOrigin::TopLeft;
+                                    rect.extents = hp.size;
+                                    rect
+                                }),
+                                transform: Transform {
+                                    translation: Vec3::new(hp.pos.x, hp.pos.y, 0.5),
+                                    ..default()
+                                },
+                                ..default()
+                            },
+                            Fill::color(Color::GREEN.with_a(0.2)),
+                            HitboxId(hp.id),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
         if let Some(image) = assets.get(&img) {
             let image_size = image.size();
             sprite.anchor = Anchor::Custom(
                 ((frame.offset / image_size) - Vec2::new(0.5, 0.5)) * Vec2::new(1.0, -1.0),
             );
-            // println!("{:?}", sprite.anchor);
-        } else {
-            // println!("No");
         }
         if *img != frame.image {
             *img = frame.image.clone();
@@ -1316,5 +1657,15 @@ fn animator(mut editor_state: ResMut<EditorState>) {
         }
         editor_state.current_frame = new_index;
         editor_state.frames_since_last_frame = 0;
+    }
+}
+
+trait Toggle {
+    fn toggle(&mut self);
+}
+
+impl Toggle for bool {
+    fn toggle(&mut self) {
+        *self = !*self;
     }
 }
